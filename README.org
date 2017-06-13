@@ -1,0 +1,4 @@
+#+TITLE: Excursions
+
+Welcome to my "excursions" repository. This is a single collection of various
+experiments before they turn into more polished work.
