@@ -1,0 +1,30 @@
+#+TITLE: batched-opengl
+
+OpenGL essentially acts as a big state machine. You poke some bits of OpenGL
+state, then tell it to draw some triangles, and voilà - triangles are drawn with
+some particular charecteristics. The problem is, each of these state transitions
+comes at a cost. While changing how back-face culling works is a fairly cheap
+state transition, changing which is the currently bound texture to a particular
+texture unit is considerably more expensive. For this reason, it's encouraged
+that draw calls are "batched" - all triangles with common state are drawn at the
+same time.
+
+This library explores this approach, building up state as a product of small
+localized state, then using =discrimination= to sort state transitions, and then
+working under a "compiled" view with linear merges that retain ordering.
+
+* References
+
+- [[https://www.reddit.com/r/gamedev/comments/60a0o1/opengl_engine_core_architecture_and_efficient/][OpenGL Engine: core architecture and efficient rendering questions]] (Reddit question)
+- [[https://www.khronos.org/opengl/wiki/Rendering_Pipeline_Overview][Rendering Pipeline Overview]] (OpenGL wiki)
+- [[https://nlguillemot.wordpress.com/2016/11/18/opengl-renderer-design/][OpenGL Renderer Design]]
+- [[https://www.khronos.org/opengl/wiki/Common_Mistakes][Common mistakes]] (OpenGL wiki)
+- [[https://developer.nvidia.com/content/how-modern-opengl-can-radically-reduce-driver-overhead-0][Beyond porting: How Modern OpenGL Can Radically Reduce Driver Overhead]] (nVidia
+  talk)
+- [[https://www.gamedev.net/resources/_/technical/opengl/opengl-api-overhead-r4614][OpenGL API Overhead]] (GameDev article)
+- [[https://www.gamedev.net/resources/_/technical/opengl/opengl-batch-rendering-r3900][OpenGL batch rendering]] (GameDev article)
+- [[http://on-demand.gputechconf.com/gtc/2013/presentations/S3032-Advanced-Scenegraph-Rendering-Pipeline.pdf][Advanced scenegraph rendering pipeline]] (GPU Technology Conference talk)
+  - [[https://github.com/nvpro-pipeline/pipeline][nvpro-pipeline]] "a research rendering pipeline" - implements the above talk
+    (and more).
+- [[http://realtimecollisiondetection.net/blog/?p=86][Order your draw calls around!]] (Real Time Collision Detection blog post)
+- [[https://www.khronos.org/opengl/wiki/Performance][Performance]] (OpenGL wiki)
