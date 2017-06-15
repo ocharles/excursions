@@ -1,0 +1,9 @@
+#+TITLE: sparse-bindless-texture-arrays
+
+A Haskell implementation of sparse bindless texture arrays, as described in
+[[http://gdcvault.com/play/1020791/][Approaching Zero Driver Overhead]] (and other talks).
+
+* References
+
+- [[https://www.khronos.org/opengl/wiki/Bindless_Texture][Bindless textures on the OpenGL wiki]]
+- [[https://www.khronos.org/registry/OpenGL/extensions/ARB/ARB_bindless_texture.txt][ARB_bindless_texture]]
