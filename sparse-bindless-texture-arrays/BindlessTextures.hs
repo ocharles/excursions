@@ -80,6 +80,7 @@ createOpenGLWindow = do
   SDL.initialize [ SDL.InitVideo ]
   window <- managed (bracket createGLWindow SDL.destroyWindow)
   SDL.glCreateContext window >>= SDL.glMakeCurrent window
+  SDL.swapInterval $= SDL.SynchronizedUpdates
   return window
 
   where
