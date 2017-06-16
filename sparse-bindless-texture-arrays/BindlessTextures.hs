@@ -1,11 +1,15 @@
+{-# language NamedFieldPuns #-}
+{-# language PatternSynonyms #-}
 {-# language OverloadedStrings #-}
+{-# language RecordWildCards #-}
 
 {-| A demonstration of ARB_bindless_texture.
 -}
 module BindlessTextures (main) where
 
-import Control.Concurrent
+import Data.IORef
 import Codec.Picture
+import Control.Concurrent
 import Control.Monad
 import Control.Monad.Catch
 import Control.Monad.Log
@@ -13,6 +17,7 @@ import Control.Monad.Managed
 import Control.Monad.Trans.Class
 import Data.Foldable (for_)
 import Data.Monoid
+import Data.StateVar
 import qualified Data.Vector.Storable as Vector
 import Foreign.C.String
 import Foreign.Marshal.Alloc
@@ -25,6 +30,70 @@ import Graphics.GL.Types
 import qualified SDL
 import System.IO (stdout)
 
+{-| A texture allocator as a 2D texture array.
+
+All textures within a texture allocator must have the same "shape" -
+dimensions and internal format.
+-}
+data TextureAllocator = TextureAllocator
+  { textureName :: GLuint
+  , nextIndex :: IORef GLint
+  }
+
+
+{-| The maximum amount of textures an allocator can hold.
+-}
+pattern MAX_TEXTURES = 2
+
+
+{-| Instantiate a new texture allocator that can allocate MAX_TEXTURES textures.
+-}
+newTextureAllocator width height internalFormat =
+  do
+    textureName <- alloca $ \ptr ->
+      do
+        glGenTextures 1 ptr
+        peek ptr
+
+    glBindTexture GL_TEXTURE_2D_ARRAY textureName
+
+    glTexStorage3D GL_TEXTURE_2D_ARRAY 1 internalFormat width height MAX_TEXTURES
+
+    nextIndex <- newIORef 0
+
+    return TextureAllocator {..}
+
+
+{-| Upload a texture with a texture allocator.
+-}
+-- loadTexture :: TextureAllocator -> FilePath -> IO Texture
+loadTexture TextureAllocator { textureName, nextIndex } path =
+  do
+    imageData <- liftIO (readImage path)
+
+    n <- readIORef nextIndex
+    modifyIORef nextIndex succ
+
+    case imageData of
+      Left e ->
+        error (show e)
+
+      Right (ImageRGB8 (Image width height pixels)) ->
+        Vector.unsafeWith pixels $ \imageData ->
+          glTexSubImage3D
+            GL_TEXTURE_2D_ARRAY
+            0
+            0
+            0
+            n
+            (fromIntegral width)
+            (fromIntegral height)
+            1
+            GL_RGB
+            GL_UNSIGNED_BYTE
+            (castPtr imageData)
+
+
 main :: IO ()
 main = runManaged $ do
   -- First we need to initialize OpenGL and create a window.
@@ -35,18 +104,14 @@ main = runManaged $ do
     gl_ARB_bindless_texture
     (error "Your graphic card does not support ARB_bindless_texture")
 
-  -- Upload a texture to OpenGL. Uses Juicy Pixels to load from disk, and then
-  -- glGenTextures/glTexStorage2D/glTexSubImage2D to create and upload the data
-  -- to an immutable texture.
-  textureId1 <- uploadTexture "test-texture.png"
-  textureId2 <- uploadTexture "test-texture-2.png"
+  textureAllocator <- liftIO (newTextureAllocator 1024 1024 GL_RGB8)
+  liftIO (loadTexture textureAllocator "test-texture.png")
+  liftIO (loadTexture textureAllocator "test-texture-2.png")
 
   -- ARB_bindless_texture: create a texture handle from our uploaded texture
   -- name.
-  textureHandle1 <- glGetTextureHandleARB textureId1
-  textureHandle2 <- glGetTextureHandleARB textureId2
-  glMakeTextureHandleResidentARB textureHandle1
-  glMakeTextureHandleResidentARB textureHandle2
+  textureHandle <- glGetTextureHandleARB (textureName textureAllocator)
+  glMakeTextureHandleResidentARB textureHandle
 
   -- Setup a vertex array for drawing. This uses a fullscreen triangle so
   -- the vertex data itself isn't important.
@@ -66,10 +131,13 @@ main = runManaged $ do
 
   -- Draw forever! This will draw a fullscreen triangle with our texture.
   glBindVertexArray vertexArray
-  for_ (cycle [textureHandle1, textureHandle2]) $ \textureHandle -> do
+
+  glUniformHandleui64ARB 0 textureHandle
+
+  for_ (cycle [0, 1]) $ \textureIndex -> do
     SDL.pollEvents
 
-    glUniformHandleui64ARB 0 textureHandle
+    glUniform1f 1 textureIndex
     glDrawArrays GL_TRIANGLES 0 3
 
     SDL.glSwapWindow window
@@ -93,14 +161,6 @@ createOpenGLWindow = do
             SDL.defaultWindow { SDL.windowOpenGL = Just openGLConfig }
 
       in  SDL.createWindow "ARB_bindless_texture example" windowConfig
-
-
-uploadTexture :: (MonadIO m) => FilePath -> m GLuint
-uploadTexture path = do
-  imageData <- liftIO (readImage path)
-  case imageData of
-    Left e                      -> error (show e)
-    Right (ImageRGB8 pixelData) -> uploadRGB8 pixelData
 
 
 newVertexArray =
@@ -167,29 +227,3 @@ linkProgram shaders = liftIO $ do
             peekCString infoLogPtr >>= putStrLn)
 
   pure programName
-
-
-uploadRGB8 :: MonadIO m => Image PixelRGB8 -> m GLuint
-uploadRGB8 (Image width height pixels) = liftIO $ do
-  name <- alloca $ \namePtr -> do
-    glGenTextures 1 namePtr
-    peek namePtr
-  glBindTexture GL_TEXTURE_2D name
-  glTexStorage2D
-    GL_TEXTURE_2D
-    1
-    GL_RGB8
-    (fromIntegral width)
-    (fromIntegral height)
-  Vector.unsafeWith pixels $ \imageData ->
-    glTexSubImage2D
-      GL_TEXTURE_2D
-      0
-      0
-      0
-      (fromIntegral width)
-      (fromIntegral height)
-      GL_RGB
-      GL_UNSIGNED_BYTE
-      (castPtr imageData)
-  return name
