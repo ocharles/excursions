@@ -9,12 +9,9 @@ module BindlessTextures (main) where
 
 import Data.IORef
 import Codec.Picture
-import Control.Concurrent
 import Control.Monad
 import Control.Monad.Catch
-import Control.Monad.Log
 import Control.Monad.Managed
-import Control.Monad.Trans.Class
 import Data.Foldable (for_)
 import Data.Monoid
 import Data.StateVar
@@ -24,15 +21,14 @@ import Foreign.Marshal.Alloc
 import Foreign.Marshal.Array
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Text.Printf
-import Foreign.Storable (peek, sizeOf)
+import Foreign.Storable (peek)
 import Graphics.GL.Core45
 import Graphics.GL.Ext.ARB.BindlessTexture
-import Graphics.GL.Ext.ARB.DirectStateAccess
 import Graphics.GL.Ext.ARB.DebugOutput
 import Graphics.GL.Ext.ARB.SparseTexture
 import Graphics.GL.Types
 import qualified SDL
-import System.IO (stdout)
+
 
 {-| A texture allocator as a 2D texture array.
 
@@ -47,12 +43,16 @@ data TextureAllocator = TextureAllocator
 
 {-| The maximum amount of textures an allocator can hold.
 -}
+pattern MAX_TEXTURES :: (Num a, Eq a) => a
 pattern MAX_TEXTURES = 2
 
 
 {-| Instantiate a new texture allocator that can allocate MAX_TEXTURES textures.
 -}
-newTextureAllocator width height internalFormat =
+newTextureAllocator
+  :: MonadIO m
+  => GLsizei -> GLsizei -> GLenum -> m TextureAllocator
+newTextureAllocator width height internalFormat = liftIO $
   do
     textureName <- alloca $ \ptr ->
       do
@@ -71,7 +71,7 @@ newTextureAllocator width height internalFormat =
 
 {-| Upload a texture with a texture allocator.
 -}
--- loadTexture :: TextureAllocator -> FilePath -> IO Texture
+loadTexture :: TextureAllocator -> FilePath -> IO ()
 loadTexture TextureAllocator { textureName, nextIndex } path =
   do
     imageData <- liftIO (readImage path)
@@ -97,7 +97,7 @@ loadTexture TextureAllocator { textureName, nextIndex } path =
             1
             GL_TRUE
 
-          Vector.unsafeWith pixels $ \imageData ->
+          Vector.unsafeWith pixels $ \ptr ->
             glTextureSubImage3D
               textureName
               0
@@ -109,7 +109,7 @@ loadTexture TextureAllocator { textureName, nextIndex } path =
               1
               GL_RGB
               GL_UNSIGNED_BYTE
-              (castPtr imageData)
+              (castPtr ptr)
 
 
 
@@ -159,7 +159,7 @@ main = runManaged $ do
   glUniformHandleui64ARB 0 textureHandle
 
   for_ (cycle [0, 1]) $ \textureIndex -> do
-    SDL.pollEvents
+    _ <- SDL.pollEvents
 
     glUniform1f 1 textureIndex
     glDrawArrays GL_TRIANGLES 0 3
@@ -167,7 +167,7 @@ main = runManaged $ do
     SDL.glSwapWindow window
 
 
--- createOpenGLWindow :: (MonadIO m) => m SDL.Window
+createOpenGLWindow :: Managed SDL.Window
 createOpenGLWindow = do
   SDL.initialize [ SDL.InitVideo ]
   window <- managed (bracket createGLWindow SDL.destroyWindow)
@@ -188,12 +188,14 @@ createOpenGLWindow = do
       in  SDL.createWindow "ARB_bindless_texture example" windowConfig
 
 
+newVertexArray :: Managed GLuint
 newVertexArray =
   liftIO $ alloca $ \ptr -> do
     glGenVertexArrays 1 ptr
     peek ptr
 
 
+compileShader :: MonadIO m => GLenum -> FilePath -> m GLuint
 compileShader stage sourceFile = liftIO $ do
   src <- readFile sourceFile
 
@@ -211,7 +213,7 @@ compileShader stage sourceFile = liftIO $ do
           glGetShaderiv shaderName GL_COMPILE_STATUS ptr *> peek ptr)
 
   unless
-    (fromIntegral compiled == GL_TRUE)
+    (compiled == GL_TRUE)
     (do putStrLn ("Shader stage failed to compile: " <> show stage)
 
         logLen <-
@@ -228,6 +230,7 @@ compileShader stage sourceFile = liftIO $ do
   pure shaderName
 
 
+linkProgram :: (Foldable list, MonadIO m) => list GLuint -> m GLuint
 linkProgram shaders = liftIO $ do
   programName <- glCreateProgram
 
@@ -239,7 +242,7 @@ linkProgram shaders = liftIO $ do
     alloca (\ptr -> glGetProgramiv programName GL_LINK_STATUS ptr *> peek ptr)
 
   unless
-    (fromIntegral compiled == GL_TRUE)
+    (compiled == GL_TRUE)
     (do putStrLn "Program failed to link"
 
         logLen <-
