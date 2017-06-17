@@ -27,6 +27,7 @@ import Text.Printf
 import Foreign.Storable (peek, sizeOf)
 import Graphics.GL.Core45
 import Graphics.GL.Ext.ARB.BindlessTexture
+import Graphics.GL.Ext.ARB.DirectStateAccess
 import Graphics.GL.Ext.ARB.DebugOutput
 import Graphics.GL.Ext.ARB.SparseTexture
 import Graphics.GL.Types
@@ -55,15 +56,13 @@ newTextureAllocator width height internalFormat =
   do
     textureName <- alloca $ \ptr ->
       do
-        glGenTextures 1 ptr
+        glCreateTextures GL_TEXTURE_2D_ARRAY 1 ptr
         peek ptr
 
-    glBindTexture GL_TEXTURE_2D_ARRAY textureName
-
     -- Mark the texture as being sparse
-    glTexParameteri GL_TEXTURE_2D_ARRAY GL_TEXTURE_SPARSE_ARB GL_TRUE
+    glTextureParameteri textureName GL_TEXTURE_SPARSE_ARB GL_TRUE
 
-    glTexStorage3D GL_TEXTURE_2D_ARRAY 1 internalFormat width height MAX_TEXTURES
+    glTextureStorage3D textureName 1 internalFormat width height MAX_TEXTURES
 
     nextIndex <- newIORef 0
 
@@ -86,6 +85,7 @@ loadTexture TextureAllocator { textureName, nextIndex } path =
 
       Right (ImageRGB8 (Image width height pixels)) ->
         do
+          glBindTexture GL_TEXTURE_2D_ARRAY textureName
           glTexPageCommitmentARB
             GL_TEXTURE_2D_ARRAY
             0
@@ -98,8 +98,8 @@ loadTexture TextureAllocator { textureName, nextIndex } path =
             GL_TRUE
 
           Vector.unsafeWith pixels $ \imageData ->
-            glTexSubImage3D
-              GL_TEXTURE_2D_ARRAY
+            glTextureSubImage3D
+              textureName
               0
               0
               0
@@ -149,9 +149,6 @@ main = runManaged $ do
     vertexShader   <- compileShader GL_VERTEX_SHADER "vertex-shader.glsl"
     fragmentShader <- compileShader GL_FRAGMENT_SHADER "fragment-shader.glsl"
     linkProgram [vertexShader, fragmentShader]
-
-  -- Unbind to prove that this is bindless
-  glBindTexture GL_TEXTURE_2D_ARRAY 0
 
   -- Inform the shader of our texture handle
   glUseProgram program
