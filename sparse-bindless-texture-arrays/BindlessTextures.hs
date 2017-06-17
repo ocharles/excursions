@@ -151,7 +151,7 @@ main = runManaged $ do
     linkProgram [vertexShader, fragmentShader]
 
   -- Unbind to prove that this is bindless
-  glBindTexture GL_TEXTURE_2D 0
+  glBindTexture GL_TEXTURE_2D_ARRAY 0
 
   -- Inform the shader of our texture handle
   glUseProgram program
