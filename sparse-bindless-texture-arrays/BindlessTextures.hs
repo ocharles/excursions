@@ -7,12 +7,13 @@
 -}
 module BindlessTextures (main) where
 
-import Data.IORef
 import Codec.Picture
 import Control.Monad
 import Control.Monad.Catch
 import Control.Monad.Managed
+import Data.Bits
 import Data.Foldable (for_)
+import Data.IORef
 import Data.Monoid
 import Data.StateVar
 import qualified Data.Vector.Storable as Vector
@@ -20,14 +21,14 @@ import Foreign.C.String
 import Foreign.Marshal.Alloc
 import Foreign.Marshal.Array
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
-import Text.Printf
-import Foreign.Storable (peek)
+import Foreign.Storable (peek, poke)
 import Graphics.GL.Core45
 import Graphics.GL.Ext.ARB.BindlessTexture
 import Graphics.GL.Ext.ARB.DebugOutput
 import Graphics.GL.Ext.ARB.SparseTexture
 import Graphics.GL.Types
 import qualified SDL
+import Text.Printf
 
 
 {-| A texture allocator as a 2D texture array.
@@ -150,8 +151,29 @@ main = runManaged $ do
     fragmentShader <- compileShader GL_FRAGMENT_SHADER "fragment-shader.glsl"
     linkProgram [vertexShader, fragmentShader]
 
-  -- Inform the shader of our texture handle
   glUseProgram program
+
+  -- Create a uniform buffer object, containing our choice of texture.
+  uboName <-
+    liftIO $ alloca $ \ptr -> do
+      glGenBuffers 1 ptr
+      peek ptr
+
+  glBindBuffer GL_UNIFORM_BUFFER uboName
+
+  glBufferStorage
+    GL_UNIFORM_BUFFER
+    4
+    nullPtr
+    (GL_MAP_PERSISTENT_BIT .|. GL_MAP_WRITE_BIT)
+
+  uboPtr <-
+    glMapBufferRange GL_UNIFORM_BUFFER 0 4 (GL_MAP_PERSISTENT_BIT .|. GL_MAP_WRITE_BIT)
+
+  liftIO $ poke (castPtr uboPtr) (1 :: GLfloat)
+
+  glUniformBlockBinding program 0 0
+  glBindBufferBase GL_UNIFORM_BUFFER 0 uboName
 
   -- Draw forever! This will draw a fullscreen triangle with our texture.
   glBindVertexArray vertexArray
@@ -161,7 +183,7 @@ main = runManaged $ do
   for_ (cycle [0, 1]) $ \textureIndex -> do
     _ <- SDL.pollEvents
 
-    glUniform1f 1 textureIndex
+    liftIO $ poke (castPtr uboPtr) (textureIndex :: GLfloat)
     glDrawArrays GL_TRIANGLES 0 3
 
     SDL.glSwapWindow window

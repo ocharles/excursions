@@ -8,8 +8,11 @@ out vec3 fResult;
 
 layout (bindless_sampler) uniform sampler2DArray t;
 
-layout (location= 1) uniform float textureIndex;
+uniform TBlock
+{
+    float textureIndex;
+} T;
 
 void main() {
-   fResult = texture2DArray(t, vec3(v_texCoord.xy, textureIndex)).rgb;
+   fResult = texture2DArray(t, vec3(v_texCoord.xy, T.textureIndex)).rgb;
 }
