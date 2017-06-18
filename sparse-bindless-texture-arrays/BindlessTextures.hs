@@ -10,7 +10,7 @@ module BindlessTextures (main) where
 import Codec.Picture
 import Control.Monad
 import Control.Monad.Catch
-import Control.Monad.Managed
+import Control.Monad.Managed hiding (with)
 import Data.Bits
 import Data.Foldable (for_)
 import Data.IORef
@@ -18,10 +18,11 @@ import Data.Monoid
 import Data.StateVar
 import qualified Data.Vector.Storable as Vector
 import Foreign.C.String
+import Foreign.Marshal.Utils (with)
 import Foreign.Marshal.Alloc
 import Foreign.Marshal.Array
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
-import Foreign.Storable (peek, poke)
+import Foreign.Storable
 import Graphics.GL.Core45
 import Graphics.GL.Ext.ARB.BindlessTexture
 import Graphics.GL.Ext.ARB.DebugOutput
@@ -29,6 +30,41 @@ import Graphics.GL.Ext.ARB.SparseTexture
 import Graphics.GL.Types
 import qualified SDL
 import Text.Printf
+
+
+{-|
+-}
+data DrawArraysIndirectCommand = DrawArraysIndirectCommand
+  { daicCount :: GLuint
+  , daicInstanceCount :: GLuint
+  , daicFirst :: GLuint
+  , daicBaseInstance :: GLuint
+  }
+
+
+instance Storable DrawArraysIndirectCommand where
+  sizeOf ~(DrawArraysIndirectCommand a b c d) =
+    sizeOf a + sizeOf b + sizeOf c + sizeOf d
+
+  alignment _ = 0
+
+  poke ptr DrawArraysIndirectCommand {daicCount, daicInstanceCount, daicFirst, daicBaseInstance} =
+    do
+      poke
+        (castPtr ptr)
+        daicCount
+      pokeByteOff
+        (castPtr ptr)
+        (sizeOf daicCount)
+        daicInstanceCount
+      pokeByteOff
+        (castPtr ptr)
+        (sizeOf daicCount + sizeOf daicInstanceCount)
+        daicFirst
+      pokeByteOff
+        (castPtr ptr)
+        (sizeOf daicCount + sizeOf daicInstanceCount + sizeOf daicFirst)
+        daicBaseInstance
 
 
 {-| A texture allocator as a 2D texture array.
@@ -180,11 +216,34 @@ main = runManaged $ do
 
   glUniformHandleui64ARB 0 textureHandle
 
+  -- Setup draw commands
+  commandBuffer <-
+    liftIO $ alloca $ \ptr -> do
+      glGenBuffers 1 ptr
+      peek ptr
+
+  glBindBuffer GL_DRAW_INDIRECT_BUFFER commandBuffer
+
+  let drawCommand =
+        DrawArraysIndirectCommand
+          { daicInstanceCount = 1
+          , daicCount = 3
+          , daicFirst = 0
+          , daicBaseInstance = 0
+          }
+
+  liftIO $ with drawCommand $ \ptr ->
+    glBufferData
+      GL_DRAW_INDIRECT_BUFFER
+      (fromIntegral (sizeOf drawCommand))
+      (castPtr ptr)
+      GL_STATIC_DRAW
+
   for_ (cycle [0, 1]) $ \textureIndex -> do
     _ <- SDL.pollEvents
 
     liftIO $ poke (castPtr uboPtr) (textureIndex :: GLfloat)
-    glDrawArrays GL_TRIANGLES 0 3
+    glMultiDrawArraysIndirect GL_TRIANGLES nullPtr 1 0
 
     SDL.glSwapWindow window
 
