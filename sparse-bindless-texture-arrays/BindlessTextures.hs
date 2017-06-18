@@ -74,6 +74,7 @@ dimensions and internal format.
 -}
 data TextureAllocator = TextureAllocator
   { textureName :: GLuint
+  , textureHandle :: GLuint64
   , nextIndex :: IORef GLint
   }
 
@@ -100,6 +101,11 @@ newTextureAllocator width height internalFormat = liftIO $
     glTextureParameteri textureName GL_TEXTURE_SPARSE_ARB GL_TRUE
 
     glTextureStorage3D textureName 1 internalFormat width height MAX_TEXTURES
+
+    -- ARB_bindless_texture: create a texture handle from our uploaded texture
+    -- name.
+    textureHandle <- glGetTextureHandleARB textureName
+    glMakeTextureHandleResidentARB textureHandle
 
     nextIndex <- newIORef 0
 
@@ -172,11 +178,6 @@ main = runManaged $ do
   liftIO (loadTexture textureAllocator "test-texture.png")
   liftIO (loadTexture textureAllocator "test-texture-2.png")
 
-  -- ARB_bindless_texture: create a texture handle from our uploaded texture
-  -- name.
-  textureHandle <- glGetTextureHandleARB (textureName textureAllocator)
-  glMakeTextureHandleResidentARB textureHandle
-
   -- Setup a vertex array for drawing. This uses a fullscreen triangle so
   -- the vertex data itself isn't important.
   vertexArray <- newVertexArray
@@ -192,37 +193,31 @@ main = runManaged $ do
   -- Create a uniform buffer object, containing our choice of texture.
   uboName <-
     liftIO $ alloca $ \ptr -> do
-      glGenBuffers 1 ptr
+      glCreateBuffers 1 ptr
       peek ptr
 
-  glBindBuffer GL_UNIFORM_BUFFER uboName
-
-  glBufferStorage
-    GL_UNIFORM_BUFFER
+  glNamedBufferStorage
+    uboName
     4
     nullPtr
-    (GL_MAP_PERSISTENT_BIT .|. GL_MAP_WRITE_BIT)
+    (GL_MAP_PERSISTENT_BIT .|. GL_MAP_WRITE_BIT .|. GL_MAP_COHERENT_BIT)
 
   uboPtr <-
-    glMapBufferRange GL_UNIFORM_BUFFER 0 4 (GL_MAP_PERSISTENT_BIT .|. GL_MAP_WRITE_BIT)
+    glMapNamedBufferRange
+      uboName
+      0
+      4
+      (GL_MAP_PERSISTENT_BIT .|. GL_MAP_WRITE_BIT .|. GL_MAP_COHERENT_BIT)
 
-  liftIO $ poke (castPtr uboPtr) (1 :: GLfloat)
+  liftIO $ poke (castPtr uboPtr) (textureHandle textureAllocator)
 
   glUniformBlockBinding program 0 0
-  glBindBufferBase GL_UNIFORM_BUFFER 0 uboName
-
-  -- Draw forever! This will draw a fullscreen triangle with our texture.
-  glBindVertexArray vertexArray
-
-  glUniformHandleui64ARB 0 textureHandle
 
   -- Setup draw commands
   commandBuffer <-
     liftIO $ alloca $ \ptr -> do
-      glGenBuffers 1 ptr
+      glCreateBuffers 1 ptr
       peek ptr
-
-  glBindBuffer GL_DRAW_INDIRECT_BUFFER commandBuffer
 
   let drawCommand =
         DrawArraysIndirectCommand
@@ -233,19 +228,33 @@ main = runManaged $ do
           }
 
   liftIO $ with drawCommand $ \ptr ->
-    glBufferData
-      GL_DRAW_INDIRECT_BUFFER
+    glNamedBufferData
+      commandBuffer
       (fromIntegral (sizeOf drawCommand))
       (castPtr ptr)
       GL_STATIC_DRAW
 
+  -- Draw forever! This will draw a fullscreen triangle with our texture.
+
+  -- Unbind GL_TEXTURE_2D_ARRAY, as we're using bindless textures (the handle
+  -- is stored in the UBO).
+  glBindTexture GL_TEXTURE_2D_ARRAY 0
+
   for_ (cycle [0, 1]) $ \textureIndex -> do
     _ <- SDL.pollEvents
 
-    liftIO $ poke (castPtr uboPtr) (textureIndex :: GLfloat)
+    glBindVertexArray vertexArray
+    glBindBuffer GL_DRAW_INDIRECT_BUFFER commandBuffer
+    glBindBufferBase GL_UNIFORM_BUFFER 0 uboName
+
+    sync <- glFenceSync GL_SYNC_GPU_COMMANDS_COMPLETE 0
+    liftIO $ pokeByteOff (castPtr uboPtr) (sizeOf (0 :: GLuint64)) (textureIndex :: GLfloat)
+
     glMultiDrawArraysIndirect GL_TRIANGLES nullPtr 1 0
 
     SDL.glSwapWindow window
+
+    glWaitSync sync 0 GL_TIMEOUT_IGNORED
 
 
 createOpenGLWindow :: Managed SDL.Window
