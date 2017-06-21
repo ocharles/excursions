@@ -76,6 +76,9 @@ newtype TextureHandle =
   deriving (Storable)
 
 
+{-| Given an OpenGL texture object, return the handle of this texture and make
+it resident.
+-}
 uploadTextureObject
   :: MonadIO m
   => TextureObject -> m TextureHandle
@@ -170,21 +173,19 @@ uploadImage internalFormat imageFormat (Image width height pixels) =
   liftIO $ do
     name <-
       alloca $ \namePtr -> do
-        glGenTextures 1 namePtr
+        glCreateTextures GL_TEXTURE_2D 1 namePtr
         peek namePtr
 
-    glBindTexture GL_TEXTURE_2D name
-
-    glTexStorage2D
-      GL_TEXTURE_2D
-      1
+    glTextureStorage2D
+      name
+      (floor (logBase 2 (fromIntegral (max width height))))
       internalFormat
       (fromIntegral width)
       (fromIntegral height)
 
     Vector.unsafeWith pixels $ \imageData ->
-      glTexSubImage2D
-        GL_TEXTURE_2D
+      glTextureSubImage2D
+        name
         0
         0
         0
