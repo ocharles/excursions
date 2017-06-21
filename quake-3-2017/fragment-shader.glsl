@@ -16,7 +16,6 @@ struct Material {
 
 struct DrawInfo {
   int materialIndex;
-  layout (bindless_sampler) sampler2D lightMapTexture;
 };
 
 layout (binding = 0) buffer Materials {
@@ -48,11 +47,20 @@ void main() {
     Pass p = passes[m.firstPass + i];
     vec4 source = texture2D(p.diffuseTexture, v_texCoord);
     result =
-      source * (vec4(p.sourceFactors[0]) + vec4(p.sourceFactors[1]) * source + vec4(p.sourceFactors[2]) * result)
+      source
+        * (vec4(p.sourceFactors[0]) +
+           vec4(p.sourceFactors[1]) * source +
+           vec4(p.sourceFactors[2]) * result +
+           vec4(p.sourceFactors[3]) * source.aaaa +
+           vec4(p.sourceFactors[4]) * result.aaaa
+           )
       +
-      result * (vec4(p.destFactors[0]) + vec4(p.destFactors[1]) * source + vec4(p.destFactors[2]) * result);
+      result
+      * (vec4(p.destFactors[0]) +
+         vec4(p.destFactors[1]) * source +
+         vec4(p.destFactors[2]) * result +
+         vec4(p.destFactors[3]) * source.aaaa +
+         vec4(p.destFactors[4]) * result.aaaa
+         );
   }
-
-  // result = vec4(v_texCoord.xy, 0, 1);
-
 }

@@ -1,27 +1,30 @@
+{-# language FlexibleContexts #-}
+{-# language GeneralizedNewtypeDeriving #-}
 {-# language NamedFieldPuns #-}
 {-# language RecordWildCards #-}
 {-# language OverloadedStrings #-}
 
 module Main where
 
-import Codec.Picture.Types
-import System.Directory
-import System.FilePath
-import Data.ByteString.Char8 (unpack)
-import Data.Traversable
-import Linear
-import Linear.Projection
-import Parser
 import Codec.Picture
+import Codec.Picture.Types
 import Control.Concurrent
 import Control.Monad
 import Control.Monad.Catch
 import Control.Monad.IO.Class
 import Control.Monad.Managed hiding (with)
-import Data.Foldable (for_)
+import Data.ByteString.Char8 (unpack)
+import Data.Foldable (for_, traverse_, toList)
+import Data.IORef (IORef)
+import qualified Data.IORef
 import Data.Int
+import Data.Map (Map)
+import qualified Data.Map.Strict as Map
 import Data.Monoid
+import qualified Data.Sequence as Seq
 import Data.StateVar
+import qualified Data.Text.IO as T
+import Data.Traversable
 import qualified Data.Vector.Generic as GV
 import qualified Data.Vector.Storable as V
 import qualified Data.Vector.Storable as Vector
@@ -37,10 +40,171 @@ import Graphics.GL.Core45
 import Graphics.GL.Ext.ARB.BindlessTexture
 import Graphics.GL.Ext.ARB.DebugOutput
 import Graphics.GL.Types
+import Linear
+import Linear.Projection
+import Parser
+import qualified Quake3.Shader.Parser as ParsedShader
+import qualified Quake3.Shader.TypeCheck as TCShader
 import qualified SDL
+import System.Directory
+import System.FilePath
+import Text.Megaparsec (parse)
 import Text.Printf
 
-data Material = Material Int32 Int32
+
+-- TEXTURE OBJECTS
+
+
+{-| A standard OpenGL texture object. -}
+newtype TextureObject =
+  TextureObject GLuint
+
+
+
+-- TEXTURE HANDLES
+
+
+{-| An opaque pointer to a texture in GPU memory.
+-}
+newtype TextureHandle =
+  TextureHandle GLuint64
+  deriving (Storable)
+
+
+uploadTextureObject
+  :: MonadIO m
+  => TextureObject -> m TextureHandle
+uploadTextureObject (TextureObject textureObjectName) = do
+  h <-
+    glGetTextureHandleARB textureObjectName
+
+  glMakeTextureHandleResidentARB h
+
+  return (TextureHandle h)
+
+
+
+-- TEXTURE MANAGER
+
+
+{-| The TextureManager is responsible for loading textures. It implements a
+cache to avoid loading textures more than once.
+-}
+newtype TextureManager = TextureManager
+  { textureCache :: IORef (Map FilePath TextureHandle)
+  }
+
+
+{-| Initialize a new texture manager.
+-}
+newTextureManager
+  :: MonadIO m
+  => m TextureManager
+newTextureManager = do
+  textureCache <-
+    newIORef Map.empty
+
+  return TextureManager {..}
+
+
+{-| Load a texture from a file path. Throws if the texture cannot be loaded.
+-}
+loadTexture
+  :: (MonadIO m, MonadCatch m)
+  => TextureManager -> FilePath -> m TextureHandle
+loadTexture (TextureManager cacheRef) filePathWithExtension = do
+  let filePath = dropExtension ("../../hs-quake-3/resources/" <> filePathWithExtension)
+
+  oldCache <-
+    get cacheRef
+
+  case Map.lookup filePath oldCache of
+    Just h ->
+      return h
+
+    Nothing -> do
+      textureObject <-
+        tryAndLoad (filePath <.> "jpg")
+          `catch` (\SomeException{} -> tryAndLoad (filePath <.> "tga"))
+          `catch` (\SomeException{} -> tryAndLoad (filePath <.> "png"))
+          `catch` (\SomeException{} -> tryAndLoad filePathWithExtension)
+
+      h <-
+        uploadTextureObject textureObject
+
+      cacheRef $~! Map.insert filePath h
+
+      return h
+
+  where
+
+    tryAndLoad filePath = do
+      imageData <-
+        liftIO (readImage filePath)
+
+      case imageData of
+        Left e ->
+          error (show e)
+
+        Right (ImageRGB8 pixelData) ->
+          uploadImage GL_RGB8 GL_RGB pixelData
+
+        Right (ImageRGBA8 pixelData) ->
+          uploadImage GL_RGBA8 GL_RGBA pixelData
+
+        Right (ImageYCbCr8 img) ->
+          uploadImage GL_RGB8 GL_RGB (convertImage img :: Image PixelRGB8)
+
+
+{-| Upload local Juicy Pixels data into an OpenGL texture.
+-}
+uploadImage
+  :: (MonadIO m, Storable (PixelBaseComponent pixel))
+  => GLuint -> GLuint -> Image pixel -> m TextureObject
+uploadImage internalFormat imageFormat (Image width height pixels) =
+  liftIO $ do
+    name <-
+      alloca $ \namePtr -> do
+        glGenTextures 1 namePtr
+        peek namePtr
+
+    glBindTexture GL_TEXTURE_2D name
+
+    glTexStorage2D
+      GL_TEXTURE_2D
+      1
+      internalFormat
+      (fromIntegral width)
+      (fromIntegral height)
+
+    Vector.unsafeWith pixels $ \imageData ->
+      glTexSubImage2D
+        GL_TEXTURE_2D
+        0
+        0
+        0
+        (fromIntegral width)
+        (fromIntegral height)
+        imageFormat
+        GL_UNSIGNED_BYTE
+        (castPtr imageData)
+
+    return (TextureObject name)
+
+
+
+-- MATERIALS
+
+
+{-| The OpenGL representation of a material is a pointer into the array of
+material passes, along with a counter of how many passes this material
+requires.
+-}
+data Material = Material
+  { materialNPasses :: Int32
+  , materialFirstPass :: Int32
+  }
+
 
 instance Storable Material where
   alignment _ = 0
@@ -50,11 +214,415 @@ instance Storable Material where
     pokeByteOff (castPtr ptr) (sizeOf a) b
 
 
+-- {-| Given a type-checked Quake 3 shader, compile this down to an OpenGL
+-- material.
+
+-- This will also load any required textures
+-- -}
+-- compileShader :: TextureManager ->
+
+
+
+-- SHADER REPOSITORY
+
+
+{-| A ShaderRepository is a map of parsed and type-checked shaders.
+-}
+newtype ShaderRepository =
+  ShaderRepository (Map String TCShader.Shader)
+
+
+loadAllShadersInDirectory
+  :: MonadIO m
+  => FilePath -> m ShaderRepository
+loadAllShadersInDirectory directory = do
+  m <-
+    liftIO $ do
+      files <- listDirectory directory
+      fmap mconcat $
+        for [f | f <- files, takeExtension f == ".shader"] $ \p -> do
+          src <- T.readFile ("../../hs-quake-3/resources/scripts" </> p)
+          case parse ParsedShader.parseShaderFile p src of
+            Left e -> do
+              putStrLn $ "Failed to parse " ++ p ++ ": " ++ show e
+              return mempty
+            Right shaders -> do
+              fmap mconcat $
+                for shaders $ \s -> do
+                  let (typeChecked, warnings) = TCShader.tcShader s
+                  traverse_
+                    (putStrLn . ((ParsedShader.shaderName s ++ ": ") ++))
+                    warnings
+                  return (Map.singleton (ParsedShader.shaderName s) typeChecked)
+  return (ShaderRepository m)
+
+
+lookupShader :: ShaderRepository -> String -> Maybe TCShader.Shader
+lookupShader (ShaderRepository m) name = Map.lookup name m
+
+
+
+-- MAPS
+
+
+{-| A map, as uploaded to OpenGL. -}
+data MapResources = MapResources
+  { mapVertexArrayObject :: VertexArrayObject
+  , mapMaterials :: ShaderStorageBufferObject
+  , mapPasses :: ShaderStorageBufferObject
+  , mapDrawCalls :: DrawIndirectBufferObject
+  , mapDrawInformation :: ShaderStorageBufferObject
+  , mapNDrawCalls :: GLsizei
+  }
+
+
+{-| Upload a .bsp map to OpenGL.
+-}
+uploadMap
+  :: (MonadIO m, MonadCatch m)
+  => TextureManager -> ShaderRepository -> BSPFile -> m MapResources
+uploadMap textureManager shaderRepository bspFile = do
+  mapVertexArrayObject <-
+    uploadMapGeometry bspFile
+
+  mapDrawCalls <-
+    uploadDrawCalls drawCalls
+
+  mapPassesByTexture <-
+    uploadMapShaders textureManager shaderRepository bspFile
+
+  (mapMaterials, mapPasses) <-
+    uploadMaterials mapPassesByTexture
+
+  mapDrawInformation <-
+    uploadDrawInformation bspFile
+
+  return MapResources
+    { mapNDrawCalls = fromIntegral (length drawCalls)
+    , ..
+    }
+
+  where
+
+    drawCalls = facesToDrawCalls bspFile
+
+
+{-| Upload vertex and index data for a map.
+-}
+uploadMapGeometry
+  :: MonadIO m
+  => BSPFile -> m VertexArrayObject
+uploadMapGeometry bspData =
+  liftIO $ do
+    vbo <-
+      V.unsafeWith (bspVertexes bspData) $ \vData -> do
+        vbo <-
+          alloca $ \ptr -> do
+            glCreateBuffers 1 ptr
+            peek ptr
+        glNamedBufferData
+          vbo
+          (fromIntegral
+             (V.length (bspVertexes bspData) *
+              sizeOf (V.head (bspVertexes bspData))))
+          (castPtr vData)
+          GL_STATIC_DRAW
+        return vbo
+    vao <-
+      alloca $ \ptr -> do
+        glGenVertexArrays 1 ptr
+        peek ptr
+    glBindVertexArray vao
+    glVertexArrayVertexBuffer
+      vao
+      0
+      vbo
+      0
+      (fromIntegral (sizeOf (undefined :: Parser.Vertex)))
+    configureVertexArrayAttributes
+      vao
+      [ VertexAttribFormat
+        {vafAttribute = 0, vafComponents = 3, vafType = GL_FLOAT, vafOffset = 0}
+      , VertexAttribFormat
+        { vafAttribute = 1
+        , vafComponents = 2
+        , vafType = GL_FLOAT
+        , vafOffset = fromIntegral (sizeOf (undefined :: V3 Float))
+        }
+      , VertexAttribFormat
+        { vafAttribute = 2
+        , vafComponents = 2
+        , vafType = GL_FLOAT
+        , vafOffset =
+            fromIntegral
+              (sizeOf (undefined :: V3 Float) + sizeOf (undefined :: V2 Float))
+        }
+      , VertexAttribFormat
+        { vafAttribute = 3
+        , vafComponents = 3
+        , vafType = GL_FLOAT
+        , vafOffset =
+            fromIntegral
+              (sizeOf (undefined :: V3 Float) + sizeOf (undefined :: V2 Float) +
+               sizeOf (undefined :: V2 Float))
+        }
+      ]
+    ebo <-
+      alloca $ \ptr -> do
+        glCreateBuffers 1 ptr
+        peek ptr
+    glBindBuffer GL_ELEMENT_ARRAY_BUFFER ebo
+    V.unsafeWith (bspMeshVerts bspData) $ \eboData ->
+      glNamedBufferData
+        ebo
+        (fromIntegral (V.length (bspMeshVerts bspData) * sizeOf (0 :: GLuint)))
+        (castPtr eboData)
+        GL_STATIC_DRAW
+    glVertexArrayElementBuffer vao ebo
+    return (VertexArrayObject vao)
+
+
+{-| Translate individual faces in a BSP file into draw calls.
+-}
+facesToDrawCalls :: BSPFile -> [DrawElementsIndirectCommand]
+facesToDrawCalls bsp =
+  map
+    (\Face {..} ->
+       DrawElementsIndirectCommand
+       { deicCount = fromIntegral faceNMeshVerts
+       , deicInstanceCount = 1
+       , deicFirstIndex = fromIntegral faceMeshVert
+       , deicBaseVertex = fromIntegral faceVertex
+       , deicBaseInstance = 0
+       })
+    (GV.toList (bspFaces bsp))
+
+
+{-| Dispatch draw calls to render a map.
+-}
+drawMap :: MonadIO m => MapResources -> m ()
+drawMap MapResources {..} = do
+  bindVertexArray mapVertexArrayObject
+  bindDrawIndirectBuffer mapDrawCalls
+
+  bindShaderStorageBufferObjectToIndex 0 mapMaterials
+  bindShaderStorageBufferObjectToIndex 1 mapPasses
+  bindShaderStorageBufferObjectToIndex 2 mapDrawInformation
+
+  glMultiDrawElementsIndirect
+    GL_TRIANGLES
+    GL_UNSIGNED_INT
+    nullPtr
+    mapNDrawCalls
+    0
+
+
+{-| Upload all (referenced) shaders in a map.
+-}
+uploadMapShaders
+  :: (MonadIO m, MonadCatch m)
+  => TextureManager -> ShaderRepository -> BSPFile -> m [[Pass]]
+uploadMapShaders textureManager shaderRepository bspFile =
+  for (GV.toList (bspTextures bspFile)) $ \t -> do
+    let textureOrShaderName = unpack (getASCII (textureName t))
+    case lookupShader shaderRepository textureOrShaderName of
+      Just shader ->
+        for (toList (TCShader._passes shader)) $ \pass -> do
+          t <-
+            case getLast (TCShader._map pass) of
+              Just (TCShader.MapTexture path) ->
+                loadTexture textureManager path `catch`
+                (\SomeException {} ->
+                   loadTexture textureManager "test-texture.png")
+              _ -> loadTexture textureManager "test-texture.png"
+
+          t <-
+            case getLast (TCShader._animMap pass) of
+              Just (TCShader.AnimMap _ (path:_)) -> do
+                liftIO (print path)
+                loadTexture textureManager path `catch`
+                  (\SomeException {} ->
+                    loadTexture textureManager "test-texture.png")
+              Nothing -> return t
+
+          let (sourceFactor, destFactor) =
+                case getLast (TCShader._blendFunc pass) of
+                  Just (src, dst) -> (src, dst)
+                  Nothing -> (TCShader.One, TCShader.Zero)
+          return (Pass (blendFuncFactors sourceFactor) (blendFuncFactors destFactor) t)
+      Nothing -> do
+        t <-
+          loadTexture textureManager textureOrShaderName `catch`
+          (\SomeException {} -> loadTexture textureManager "test-texture.png")
+        return [Pass (1, 0, 0, 0, 0) (0, 0, 0, 0, 0) t]
+
+  where
+
+    blendFuncFactors TCShader.Zero             = (0, 0, 0, 0, 0)
+    blendFuncFactors TCShader.One              = (1, 0, 0, 0, 0)
+    blendFuncFactors TCShader.SrcColor         = (0, 1, 0, 0, 0)
+    blendFuncFactors TCShader.DstColor         = (0, 0, 1, 0, 0)
+    blendFuncFactors TCShader.SrcAlpha         = (0, 0, 0, 1, 0)
+    blendFuncFactors TCShader.OneMinusSrcAlpha = (1, 0, 0, -1, 0)
+    blendFuncFactors TCShader.OneMinusDstAlpha = (1, 0, 0, 0, -1)
+    blendFuncFactors a = error (show a)
+
+
+{-| Upload a list of materials and their passes to separate material and pass
+buffers.
+-}
+uploadMaterials
+  :: MonadIO m
+  => [[Pass]] -> m (ShaderStorageBufferObject, ShaderStorageBufferObject)
+uploadMaterials materialsWithPasses =
+  liftIO $ do
+    materialsBuffer <-
+      alloca $ \ptr -> do
+        glCreateBuffers 1 ptr
+        peek ptr
+    let materials =
+          map
+            (\(passes, firstIndex) ->
+               Material (fromIntegral (length passes)) (fromIntegral firstIndex))
+            (zip
+               materialsWithPasses
+               (scanl (+) 0 (map length materialsWithPasses)))
+    withArray materials $ \ptr ->
+      glNamedBufferData
+        materialsBuffer
+        (fromIntegral (sizeOf (head materials) * length materials))
+        (castPtr ptr)
+        GL_STATIC_DRAW
+    passesBuffer <-
+      alloca $ \ptr -> do
+        glCreateBuffers 1 ptr
+        peek ptr
+    let passes = concat materialsWithPasses
+    withArray passes $ \ptr ->
+      glNamedBufferData
+        passesBuffer
+        (fromIntegral (sizeOf (head passes) * length passes))
+        (castPtr ptr)
+        GL_STATIC_DRAW
+    return
+      ( ShaderStorageBufferObject materialsBuffer
+      , ShaderStorageBufferObject passesBuffer)
+
+
+{-| Upload draw information for all faces in a map.
+-}
+uploadDrawInformation
+  :: MonadIO m
+  => BSPFile -> m ShaderStorageBufferObject
+uploadDrawInformation bsp =
+  liftIO $ do
+    drawInfosBuffer <-
+      alloca $ \ptr -> do
+        glCreateBuffers 1 ptr
+        peek ptr
+    let drawInfos =
+          map (getLittleEndian . faceTexture) (GV.toList $ bspFaces bsp)
+    withArray drawInfos $ \ptr ->
+      glNamedBufferData
+        drawInfosBuffer
+        (fromIntegral (sizeOf (head drawInfos) * length drawInfos))
+        (castPtr ptr)
+        GL_STATIC_DRAW
+    return (ShaderStorageBufferObject drawInfosBuffer)
+
+
+
+-- VERTEX ARRAY OBJECTS
+
+
+newtype VertexArrayObject =
+  VertexArrayObject GLuint
+
+
+bindVertexArray :: MonadIO m => VertexArrayObject -> m ()
+bindVertexArray (VertexArrayObject n) = glBindVertexArray n
+
+
+
+-- SHADER STORAGE BUFFER OBJECTS
+
+
+newtype ShaderStorageBufferObject =
+  ShaderStorageBufferObject GLuint
+
+bindShaderStorageBufferObjectToIndex
+  :: MonadIO m
+  => GLuint -> ShaderStorageBufferObject -> m ()
+bindShaderStorageBufferObjectToIndex n (ShaderStorageBufferObject m) =
+  glBindBufferBase GL_SHADER_STORAGE_BUFFER n m
+
+
+
+-- INDIRECT DRAWING
+
+
+newtype DrawIndirectBufferObject =
+  DrawIndirectBufferObject GLuint
+
+
+uploadDrawCalls
+  :: MonadIO m
+  => [DrawElementsIndirectCommand] -> m DrawIndirectBufferObject
+uploadDrawCalls drawCalls =
+  liftIO $ do
+    bufferObject <-
+      alloca $ \ptr -> do
+        glCreateBuffers 1 ptr
+        peek ptr
+    withArray drawCalls $ \ptr ->
+      glNamedBufferData
+        bufferObject
+        (fromIntegral (sizeOf (head drawCalls) * length drawCalls))
+        (castPtr ptr)
+        GL_STATIC_DRAW
+    return (DrawIndirectBufferObject bufferObject)
+
+
+bindDrawIndirectBuffer :: MonadIO m => DrawIndirectBufferObject -> m ()
+bindDrawIndirectBuffer (DrawIndirectBufferObject n) =
+  glBindBuffer GL_DRAW_INDIRECT_BUFFER n
+
+
+data DrawElementsIndirectCommand = DrawElementsIndirectCommand
+  { deicCount :: GLuint
+  , deicInstanceCount :: GLuint
+  , deicFirstIndex :: GLuint
+  , deicBaseVertex :: GLuint
+  , deicBaseInstance :: GLuint
+  }
+
+
+instance Storable DrawElementsIndirectCommand where
+  sizeOf ~(DrawElementsIndirectCommand a b c d e) =
+    sizeOf a + sizeOf b + sizeOf c + sizeOf d + sizeOf e
+
+  alignment _ = 0
+
+  poke ptr (DrawElementsIndirectCommand a b c d e) = do
+    poke (castPtr ptr) a
+    pokeByteOff (castPtr ptr) (sizeOf a) b
+    pokeByteOff (castPtr ptr) (sizeOf b + sizeOf a) c
+    pokeByteOff (castPtr ptr) (sizeOf c + sizeOf b + sizeOf a) d
+    pokeByteOff (castPtr ptr) (sizeOf d + sizeOf c + sizeOf b + sizeOf a) e
+
+
+
+-- PASSES
+
+
+{-| A single pass used by a material.
+-}
 data Pass = Pass
   { sourceFactors :: (Int32, Int32, Int32, Int32, Int32)
   , destFactors :: (Int32, Int32, Int32, Int32, Int32)
-  , diffuseTexture :: GLuint64
+  , diffuseTexture :: TextureHandle
   }
+
 
 instance Storable Pass where
   alignment _ = 0
@@ -73,218 +641,59 @@ instance Storable Pass where
     pokeByteOff (castPtr ptr) 36 j
     pokeByteOff (castPtr ptr) 40 k
 
+
+
+-- MAIN
+
+
 main :: IO ()
 main =
   runManaged $ do
-    window <- createOpenGLWindow "Quake 3"
-    liftIO $ putStrLn "Compiling shaders"
-    vertexShader <- compileShader GL_VERTEX_SHADER "vertex-shader.glsl"
-    fragmentShader <- compileShader GL_FRAGMENT_SHADER "fragment-shader.glsl"
-    program <- linkProgram [vertexShader, fragmentShader]
-    liftIO $ putStrLn "Loading BSP"
-    bspData <- liftIO $ loadBSP "../../hs-quake-3/resources/maps/q3dm1.bsp"
-    liftIO $ putStrLn "Building materials buffer"
-    materialsBuffer <-
-      liftIO $
-      alloca $ \ptr -> do
-        glGenBuffers 1 ptr
-        peek ptr
-    glBindBuffer GL_SHADER_STORAGE_BUFFER materialsBuffer
-    let materials =
-          map (Material 1) $
-          map fst $ zip [0 ..] (GV.toList $ bspTextures bspData)
-    liftIO $
-      withArray materials $ \ptr ->
-        glBufferData
-          GL_SHADER_STORAGE_BUFFER
-          (fromIntegral (sizeOf (head materials) * length materials))
-          (castPtr ptr)
-          GL_STATIC_DRAW
-    let loadTexture p = do
-          h <- uploadTexture p >>= glGetTextureHandleARB
-          glMakeTextureHandleResidentARB h
-          return h
-    debugTexture <- loadTexture "test-texture.png"
-    blocks <-
-      loadTexture
-        "../../hs-quake-3/resources/textures/gothic_block/blocks11b.jpg"
-    textureHandles <-
-      liftIO $
-      for (GV.toList $ bspTextures bspData) $ \t -> do
-        let name =
-              "../../hs-quake-3/resources/" <> unpack (getASCII (textureName t))
-        loadTexture (name <.> ".tga") `catch`
-          (\(SomeException e) -> loadTexture (name <.> ".jpg")) `catch`
-          (\(SomeException e) -> do
-             putStrLn ("Missing " ++ show name)
-             return debugTexture)
-    liftIO $ putStrLn "Building passes buffer"
-    passesBuffer <-
-      liftIO $
-      alloca $ \ptr -> do
-        glGenBuffers 1 ptr
-        peek ptr
-    glBindBuffer GL_SHADER_STORAGE_BUFFER passesBuffer
-    let passes =
-          Pass (1, 0, 0, 0, 0) (0, 0, 0, 0, 0) debugTexture :
-          Pass (1, 0, 0, 0, 0) (0, 0, 0, 0, 0) blocks :
-          map (Pass (1, 0, 0, 0, 0) (0, 0, 0, 0, 0)) textureHandles
-    liftIO $
-      withArray passes $ \ptr ->
-        glBufferData
-          GL_SHADER_STORAGE_BUFFER
-          (fromIntegral (sizeOf (head passes) * length passes))
-          (castPtr ptr)
-          GL_STATIC_DRAW
-    let faces =
-          map
-            (\(LeafFace (LittleEndian n)) ->
-               bspFaces bspData GV.! fromIntegral n)
-            (V.toList $ bspLeafFaces bspData)
-    liftIO $ putStrLn "Building draw info buffer"
-    drawInfosBuffer <-
-      liftIO $
-      alloca $ \ptr -> do
-        glGenBuffers 1 ptr
-        peek ptr
-    glBindBuffer GL_SHADER_STORAGE_BUFFER drawInfosBuffer
-    let drawInfos = map (getLittleEndian . faceTexture) faces
-    liftIO $
-      withArray drawInfos $ \ptr ->
-        glBufferData
-          GL_SHADER_STORAGE_BUFFER
-          (fromIntegral (sizeOf (head drawInfos) * length drawInfos))
-          (castPtr ptr)
-          GL_STATIC_DRAW
-    glBindBufferBase GL_SHADER_STORAGE_BUFFER 0 materialsBuffer
-    glBindBufferBase GL_SHADER_STORAGE_BUFFER 1 passesBuffer
-    glBindBufferBase GL_SHADER_STORAGE_BUFFER 2 drawInfosBuffer
-    liftIO $ putStrLn "Uploading map"
-    bsp <-
-      liftIO $ do
-        vbo <-
-          V.unsafeWith (bspVertexes bspData) $ \vData -> do
-            vbo <-
-              alloca $ \ptr -> do
-                glGenBuffers 1 ptr
-                peek ptr
-            glBindBuffer GL_ARRAY_BUFFER vbo
-            glBufferData
-              GL_ARRAY_BUFFER
-              (fromIntegral
-                 (V.length (bspVertexes bspData) *
-                  sizeOf (V.head (bspVertexes bspData))))
-              (castPtr vData)
-              GL_STATIC_DRAW
-            return vbo
-        vao <-
-          alloca $ \ptr -> do
-            glGenVertexArrays 1 ptr
-            peek ptr
-        glBindVertexArray vao
-        glVertexArrayVertexBuffer
-          vao
-          0
-          vbo
-          0
-          (fromIntegral (sizeOf (undefined :: Parser.Vertex)))
-        configureVertexArrayAttributes
-          vao
-          [ VertexAttribFormat
-            { vafAttribute = 0
-            , vafComponents = 3
-            , vafType = GL_FLOAT
-            , vafOffset = 0
-            }
-          , VertexAttribFormat
-            { vafAttribute = 1
-            , vafComponents = 2
-            , vafType = GL_FLOAT
-            , vafOffset = fromIntegral (sizeOf (undefined :: V3 Float))
-            }
-          , VertexAttribFormat
-            { vafAttribute = 2
-            , vafComponents = 2
-            , vafType = GL_FLOAT
-            , vafOffset =
-                fromIntegral
-                  (sizeOf (undefined :: V3 Float) +
-                   sizeOf (undefined :: V2 Float))
-            }
-          , VertexAttribFormat
-            { vafAttribute = 3
-            , vafComponents = 3
-            , vafType = GL_FLOAT
-            , vafOffset =
-                fromIntegral
-                  (sizeOf (undefined :: V3 Float) +
-                   sizeOf (undefined :: V2 Float) +
-                   sizeOf (undefined :: V2 Float))
-            }
-          ]
-        ebo <-
-          alloca $ \ptr -> do
-            glGenBuffers 1 ptr
-            peek ptr
-        glBindBuffer GL_ELEMENT_ARRAY_BUFFER ebo
-        V.unsafeWith (bspMeshVerts bspData) $ \eboData ->
-          glBufferData
-            GL_ELEMENT_ARRAY_BUFFER
-            (fromIntegral
-               (V.length (bspMeshVerts bspData) * sizeOf (0 :: GLuint)))
-            (castPtr eboData)
-            GL_STATIC_DRAW
-        glVertexArrayElementBuffer vao ebo
-        return vao
-    glUseProgram program
-    glBindVertexArray bsp
-    liftIO $ withCString "a_position" (glBindAttribLocation program 0)
-    liftIO $ withCString "a_normal" (glBindAttribLocation program 3)
-    liftIO $ withCString "a_uv_0" (glBindAttribLocation program 1)
-    liftIO $ withCString "a_uv_1" (glBindAttribLocation program 2)
+    window <-
+      createOpenGLWindow "Quake 3"
+
+    textureManager <-
+      newTextureManager
+
+    shaderRepository <-
+      loadAllShadersInDirectory "../../hs-quake-3/resources/scripts"
+
+    mapData <-
+      loadBSP "../../hs-quake-3/resources/maps/q3dm1.bsp"
+
+    mapResources <-
+      liftIO $ uploadMap textureManager shaderRepository mapData
+
+    mapProgram <- do
+      vertexShader <-
+        compileShader GL_VERTEX_SHADER "vertex-shader.glsl"
+
+      fragmentShader <-
+        compileShader GL_FRAGMENT_SHADER "fragment-shader.glsl"
+
+      linkProgram [vertexShader, fragmentShader]
+
+    glClearColor 1 0 0 1
+    glUseProgram mapProgram
+    liftIO $ withCString "a_position" (glBindAttribLocation mapProgram 0)
+    liftIO $ withCString "a_normal" (glBindAttribLocation mapProgram 3)
+    liftIO $ withCString "a_uv_0" (glBindAttribLocation mapProgram 1)
+    liftIO $ withCString "a_uv_1" (glBindAttribLocation mapProgram 2)
     liftIO $
       with
         (perspective 1.047 (800 / 600) 0.1 5000 !*!
          lookAt (V3 500 10 (-400)) (V3 500 10 (-401)) (V3 0 1 0) :: M44 Float)
         (glUniformMatrix4fv 0 1 GL_TRUE . castPtr)
     glEnable GL_DEPTH_TEST
-    drawCommands <-
-      liftIO $
-      alloca $ \ptr -> do
-        glGenBuffers 1 ptr
-        peek ptr
-    glBindBuffer GL_DRAW_INDIRECT_BUFFER drawCommands
-    let daics =
-          map
-            (\Face {..} ->
-               DrawElementsIndirectCommand
-               { deicCount = fromIntegral faceNMeshVerts
-               , deicInstanceCount = 1
-               , deicFirstIndex = fromIntegral faceMeshVert
-               , deicBaseVertex = fromIntegral faceVertex
-               , deicBaseInstance = 0
-               })
-            faces
-    liftIO $
-      withArray daics $ \ptr ->
-        glBufferData
-          GL_DRAW_INDIRECT_BUFFER
-          (fromIntegral (sizeOf (head daics) * length daics))
-          (castPtr ptr)
-          GL_STATIC_DRAW
+
     forever $ do
       SDL.pollEvents
-      glClearColor 1 0 0 1
-      glClear (GL_DEPTH_BUFFER_BIT)
-      glMultiDrawElementsIndirect
-        GL_TRIANGLES
-        GL_UNSIGNED_INT
-        nullPtr
-        (fromIntegral (length daics))
-        0
-      SDL.glSwapWindow window
-    return ()
 
+      glClear GL_DEPTH_BUFFER_BIT
+
+      drawMap mapResources
+
+      SDL.glSwapWindow window
 
 
 createOpenGLWindow windowTitle = do
@@ -365,14 +774,14 @@ linkProgram shaders = liftIO $ do
 
   pure programName
 
-uploadTexture :: (MonadIO m) => FilePath -> m GLuint
-uploadTexture path = do
-  imageData <- liftIO (readImage path)
-  case imageData of
-    Left e                      -> error (show e)
-    Right (ImageRGB8 pixelData) -> uploadRGB8 pixelData
-    Right (ImageYCbCr8 img) ->
-      uploadRGB8 (convertImage img :: Image PixelRGB8)
+-- uploadTexture :: (MonadIO m) => FilePath -> m GLuint
+-- uploadTexture path = do
+--   imageData <- liftIO (readImage path)
+--   case imageData of
+--     Left e -> error (show e)
+--     Right (ImageRGB8 pixelData) -> uploadImage GL_RGB8 GL_RGB pixelData
+--     Right (ImageYCbCr8 img) ->
+--       uploadRGB8 GL_RGB8 GL_RGB (convertImage img :: Image PixelRGB8)
 
 
 
@@ -383,30 +792,32 @@ newVertexArray =
     peek ptr
 
 
-uploadRGB8 :: MonadIO m => Image PixelRGB8 -> m GLuint
-uploadRGB8 (Image width height pixels) = liftIO $ do
-  name <- alloca $ \namePtr -> do
-    glGenTextures 1 namePtr
-    peek namePtr
-  glBindTexture GL_TEXTURE_2D name
-  glTexStorage2D
-    GL_TEXTURE_2D
-    1
-    GL_RGB8
-    (fromIntegral width)
-    (fromIntegral height)
-  Vector.unsafeWith pixels $ \imageData ->
-    glTexSubImage2D
-      GL_TEXTURE_2D
-      0
-      0
-      0
-      (fromIntegral width)
-      (fromIntegral height)
-      GL_RGB
-      GL_UNSIGNED_BYTE
-      (castPtr imageData)
-  return name
+-- uploadImage :: MonadIO m => GLuint -> GLuint -> Image pixel -> m GLuint
+-- uploadImage imageFormat internalFormat (Image width height pixels) =
+--   liftIO $ do
+--     name <-
+--       alloca $ \namePtr -> do
+--         glGenTextures 1 namePtr
+--         peek namePtr
+--     glBindTexture GL_TEXTURE_2D name
+--     glTexStorage2D
+--       GL_TEXTURE_2D
+--       1
+--       internalFormat
+--       (fromIntegral width)
+--       (fromIntegral height)
+--     Vector.unsafeWith pixels $ \imageData ->
+--       glTexSubImage2D
+--         GL_TEXTURE_2D
+--         0
+--         0
+--         0
+--         (fromIntegral width)
+--         (fromIntegral height)
+--         pixelFormat
+--         GL_UNSIGNED_BYTE
+--         (castPtr imageData)
+--     return name
 
 installDebugHook :: MonadIO m => m ()
 installDebugHook
@@ -486,39 +897,6 @@ configureVertexArrayAttributes vao formats =
       (fromIntegral GL_FALSE)
       vafOffset
 
-data DrawElementsIndirectCommand = DrawElementsIndirectCommand
-  { deicCount :: GLuint
-  , deicInstanceCount :: GLuint
-  , deicFirstIndex :: GLuint
-  , deicBaseVertex :: GLuint
-  , deicBaseInstance :: GLuint
-  }
 
-
-instance Storable DrawElementsIndirectCommand where
-  sizeOf ~(DrawElementsIndirectCommand a b c d e) =
-    sizeOf a + sizeOf b + sizeOf c + sizeOf d + sizeOf e
-
-  alignment _ = 0
-
-  poke ptr (DrawElementsIndirectCommand a b c d e) =
-    do
-      poke
-        (castPtr ptr)
-        a
-      pokeByteOff
-        (castPtr ptr)
-        (sizeOf a)
-        b
-      pokeByteOff
-        (castPtr ptr)
-        (sizeOf b + sizeOf a)
-        c
-      pokeByteOff
-        (castPtr ptr)
-        (sizeOf c + sizeOf b + sizeOf a)
-        d
-      pokeByteOff
-        (castPtr ptr)
-        (sizeOf d + sizeOf c + sizeOf b + sizeOf a)
-        e
+newIORef :: MonadIO m => a -> m (IORef a)
+newIORef = liftIO . Data.IORef.newIORef
