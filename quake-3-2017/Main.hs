@@ -6,6 +6,8 @@
 
 module Main where
 
+import Data.Word
+import Data.Bits
 import Codec.Picture
 import Codec.Picture.Types
 import Control.Concurrent
@@ -147,13 +149,13 @@ loadTexture (TextureManager cacheRef) filePathWithExtension = do
           error (show e)
 
         Right (ImageRGB8 pixelData) ->
-          uploadImage GL_RGB8 GL_RGB pixelData
+          uploadImage GL_SRGB8 GL_RGB pixelData
 
         Right (ImageRGBA8 pixelData) ->
-          uploadImage GL_RGBA8 GL_RGBA pixelData
+          uploadImage GL_SRGB8_ALPHA8 GL_RGBA pixelData
 
         Right (ImageYCbCr8 img) ->
-          uploadImage GL_RGB8 GL_RGB (convertImage img :: Image PixelRGB8)
+          uploadImage GL_SRGB8 GL_RGB (convertImage img :: Image PixelRGB8)
 
 
 {-| Upload local Juicy Pixels data into an OpenGL texture.
@@ -273,6 +275,7 @@ data MapResources = MapResources
   , mapDrawCalls :: DrawIndirectBufferObject
   , mapDrawInformation :: ShaderStorageBufferObject
   , mapNDrawCalls :: GLsizei
+  , mapLightMaps :: ShaderStorageBufferObject
   }
 
 
@@ -297,6 +300,9 @@ uploadMap textureManager shaderRepository bspFile = do
   mapDrawInformation <-
     uploadDrawInformation bspFile
 
+  mapLightMaps <-
+    uploadLightMaps bspFile
+
   return MapResources
     { mapNDrawCalls = fromIntegral (length drawCalls)
     , ..
@@ -305,6 +311,65 @@ uploadMap textureManager shaderRepository bspFile = do
   where
 
     drawCalls = facesToDrawCalls bspFile
+
+
+uploadLightMaps
+  :: MonadIO m
+  => BSPFile -> m ShaderStorageBufferObject
+uploadLightMaps BSPFile {bspLightMaps} = do
+  handles <-
+    liftIO $
+    for
+      (V.toList bspLightMaps)
+      (\(LightMap pixels) -> do
+         let overBrightPixels :: V.Vector Word8
+             overBrightPixels =
+               V.fromList $
+               concat $
+               [ let overbright = 2
+                     colours =
+                       [ shiftL
+                         (fromIntegral (pixels V.! (j * 3 + n)) :: Int)
+                         overbright
+                       | n <- [0 .. 2]
+                       ]
+                 in fmap fromIntegral $
+                    if any (> 255) colours
+                      then let maxi = maximum colours
+                           in fmap (\a -> a * 255 `div` maxi) colours
+                      else colours
+               | j <- [0 .. 128 * 128 - 1]
+               ]
+         name <-
+           alloca $ \namePtr -> do
+             glGenTextures 1 namePtr
+             peek namePtr
+         glBindTexture GL_TEXTURE_2D name
+         glTexStorage2D GL_TEXTURE_2D 1 GL_RGB8 128 128
+         Vector.unsafeWith overBrightPixels $ \imageData ->
+           glTexSubImage2D
+             GL_TEXTURE_2D
+             0
+             0
+             0
+             128
+             128
+             GL_RGB
+             GL_UNSIGNED_BYTE
+             (castPtr imageData)
+         uploadTextureObject (TextureObject name))
+  b <-
+    liftIO $
+    alloca $ \ptr -> do
+      glCreateBuffers 1 ptr
+      peek ptr
+  liftIO $ withArray handles $ \ptr ->
+    glNamedBufferData
+      b
+      (fromIntegral (length handles * sizeOf (head handles)))
+      (castPtr ptr)
+      GL_STATIC_DRAW
+  return (ShaderStorageBufferObject b)
 
 
 {-| Upload vertex and index data for a map.
@@ -408,6 +473,7 @@ drawMap MapResources {..} = do
   bindShaderStorageBufferObjectToIndex 0 mapMaterials
   bindShaderStorageBufferObjectToIndex 1 mapPasses
   bindShaderStorageBufferObjectToIndex 2 mapDrawInformation
+  bindShaderStorageBufferObjectToIndex 3 mapLightMaps
 
   glMultiDrawElementsIndirect
     GL_TRIANGLES
@@ -435,34 +501,48 @@ uploadMapShaders textureManager shaderRepository bspFile =
                 (\SomeException {} ->
                    loadTexture textureManager "test-texture.png")
               _ -> loadTexture textureManager "test-texture.png"
-
           t <-
             case getLast (TCShader._animMap pass) of
               Just (TCShader.AnimMap _ (path:_)) -> do
                 liftIO (print path)
                 loadTexture textureManager path `catch`
                   (\SomeException {} ->
-                    loadTexture textureManager "test-texture.png")
+                     loadTexture textureManager "test-texture.png")
               Nothing -> return t
-
           let (sourceFactor, destFactor) =
                 case getLast (TCShader._blendFunc pass) of
                   Just (src, dst) -> (src, dst)
                   Nothing -> (TCShader.One, TCShader.Zero)
-          return (Pass (blendFuncFactors sourceFactor) (blendFuncFactors destFactor) t)
+          return
+            (Pass
+               (blendFuncFactors sourceFactor)
+               (blendFuncFactors destFactor)
+               t
+               (case getLast (TCShader._map pass) of
+                  Just TCShader.MapLightMap -> 1
+                  _ -> 0))
       Nothing -> do
         t <-
           loadTexture textureManager textureOrShaderName `catch`
           (\SomeException {} -> loadTexture textureManager "test-texture.png")
-        return [Pass (1, 0, 0, 0, 0) (0, 0, 0, 0, 0) t]
-
+        return
+          [ Pass
+              (blendFuncFactors TCShader.One)
+              (blendFuncFactors TCShader.Zero)
+              t
+              1
+          , Pass
+              (blendFuncFactors TCShader.DstColor)
+              (blendFuncFactors TCShader.Zero)
+              t
+              0
+          ]
   where
-
-    blendFuncFactors TCShader.Zero             = (0, 0, 0, 0, 0)
-    blendFuncFactors TCShader.One              = (1, 0, 0, 0, 0)
-    blendFuncFactors TCShader.SrcColor         = (0, 1, 0, 0, 0)
-    blendFuncFactors TCShader.DstColor         = (0, 0, 1, 0, 0)
-    blendFuncFactors TCShader.SrcAlpha         = (0, 0, 0, 1, 0)
+    blendFuncFactors TCShader.Zero = (0, 0, 0, 0, 0)
+    blendFuncFactors TCShader.One = (1, 0, 0, 0, 0)
+    blendFuncFactors TCShader.SrcColor = (0, 1, 0, 0, 0)
+    blendFuncFactors TCShader.DstColor = (0, 0, 1, 0, 0)
+    blendFuncFactors TCShader.SrcAlpha = (0, 0, 0, 1, 0)
     blendFuncFactors TCShader.OneMinusSrcAlpha = (1, 0, 0, -1, 0)
     blendFuncFactors TCShader.OneMinusDstAlpha = (1, 0, 0, 0, -1)
     blendFuncFactors a = error (show a)
@@ -509,6 +589,20 @@ uploadMaterials materialsWithPasses =
       , ShaderStorageBufferObject passesBuffer)
 
 
+data DrawInformation = DrawInformation
+  { materialIndex :: Int32
+  , lightMapIndex :: Int32
+  }
+
+
+instance Storable DrawInformation where
+  sizeOf ~(DrawInformation a b) = sizeOf a + sizeOf b
+  alignment _ = 4
+  poke ptr (DrawInformation a b) = do
+    pokeByteOff (castPtr ptr) 0 a
+    pokeByteOff (castPtr ptr) 4 b
+
+
 {-| Upload draw information for all faces in a map.
 -}
 uploadDrawInformation
@@ -521,7 +615,13 @@ uploadDrawInformation bsp =
         glCreateBuffers 1 ptr
         peek ptr
     let drawInfos =
-          map (getLittleEndian . faceTexture) (GV.toList $ bspFaces bsp)
+          map
+            (\face ->
+               DrawInformation
+               { materialIndex = getLittleEndian (faceTexture face)
+               , lightMapIndex = getLittleEndian (faceLMIndex face)
+               })
+            (GV.toList $ bspFaces bsp)
     withArray drawInfos $ \ptr ->
       glNamedBufferData
         drawInfosBuffer
@@ -621,14 +721,15 @@ data Pass = Pass
   { sourceFactors :: (Int32, Int32, Int32, Int32, Int32)
   , destFactors :: (Int32, Int32, Int32, Int32, Int32)
   , diffuseTexture :: TextureHandle
+  , lightMap :: Int32
   }
 
 
 instance Storable Pass where
   alignment _ = 0
-  sizeOf ~(Pass (a, _, _, _, _) _ k) =
-    sizeOf a * 10 + sizeOf k
-  poke ptr (Pass (a, b, c, d, e) (f, g, h, i, j) k) = do
+  sizeOf ~(Pass (a, _, _, _, _) _ k l) =
+    sizeOf a * 10 + sizeOf k + 8
+  poke ptr (Pass (a, b, c, d, e) (f, g, h, i, j) k l) = do
     pokeByteOff (castPtr ptr) 0 a
     pokeByteOff (castPtr ptr) 4 b
     pokeByteOff (castPtr ptr) 8 c
@@ -640,6 +741,7 @@ instance Storable Pass where
     pokeByteOff (castPtr ptr) 32 i
     pokeByteOff (castPtr ptr) 36 j
     pokeByteOff (castPtr ptr) 40 k
+    pokeByteOff (castPtr ptr) 48 l
 
 
 
@@ -682,9 +784,11 @@ main =
     liftIO $
       with
         (perspective 1.047 (800 / 600) 0.1 5000 !*!
-         lookAt (V3 500 10 (-400)) (V3 500 10 (-401)) (V3 0 1 0) :: M44 Float)
+         lookAt (V3 680 100 (-100)) (V3 680 100 (-101)) (V3 0 1 0) :: M44 Float)
         (glUniformMatrix4fv 0 1 GL_TRUE . castPtr)
+
     glEnable GL_DEPTH_TEST
+    glEnable GL_FRAMEBUFFER_SRGB
 
     forever $ do
       SDL.pollEvents
@@ -774,16 +878,6 @@ linkProgram shaders = liftIO $ do
 
   pure programName
 
--- uploadTexture :: (MonadIO m) => FilePath -> m GLuint
--- uploadTexture path = do
---   imageData <- liftIO (readImage path)
---   case imageData of
---     Left e -> error (show e)
---     Right (ImageRGB8 pixelData) -> uploadImage GL_RGB8 GL_RGB pixelData
---     Right (ImageYCbCr8 img) ->
---       uploadRGB8 GL_RGB8 GL_RGB (convertImage img :: Image PixelRGB8)
-
-
 
 newVertexArray :: MonadIO m => m GLuint
 newVertexArray =
@@ -791,33 +885,6 @@ newVertexArray =
     glGenVertexArrays 1 ptr
     peek ptr
 
-
--- uploadImage :: MonadIO m => GLuint -> GLuint -> Image pixel -> m GLuint
--- uploadImage imageFormat internalFormat (Image width height pixels) =
---   liftIO $ do
---     name <-
---       alloca $ \namePtr -> do
---         glGenTextures 1 namePtr
---         peek namePtr
---     glBindTexture GL_TEXTURE_2D name
---     glTexStorage2D
---       GL_TEXTURE_2D
---       1
---       internalFormat
---       (fromIntegral width)
---       (fromIntegral height)
---     Vector.unsafeWith pixels $ \imageData ->
---       glTexSubImage2D
---         GL_TEXTURE_2D
---         0
---         0
---         0
---         (fromIntegral width)
---         (fromIntegral height)
---         pixelFormat
---         GL_UNSIGNED_BYTE
---         (castPtr imageData)
---     return name
 
 installDebugHook :: MonadIO m => m ()
 installDebugHook

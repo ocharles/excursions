@@ -3,6 +3,8 @@
 #extension GL_ARB_shader_draw_parameters : require
 
 out vec2 v_texCoord;
+out vec2 v_texCoord_lm;
+
 flat out int drawId;
 
 uniform mat4 u_projViewModel;
@@ -23,4 +25,5 @@ void main()
   drawId = gl_DrawIDARB;
 
   v_texCoord = a_uv_0;
+  v_texCoord_lm = a_uv_1;
 }
