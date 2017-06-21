@@ -1,1 +1,235 @@
 #+TITLE: Quake 3 in 2017
+
+What would a Quake 3 renderer look like in 2017? In this excursion, I explore
+the capabilities of OpenGL 4.5 (and beyond!) to see what we can manage.
+
+The result? Quake 3 maps rendered in *a single draw call*.
+
+* Motivation
+
+Traditionally, rendering graphics /efficiently/ can be a bit of a pain. OpenGL
+is - and I'm handwaving here - a gigantic state machine. We are given the
+ability to create various "objects", and we can modify these objects through a
+sequence of state changing instructions. For example, to upload some vertex
+geometry one might do the following:
+
+#+BEGIN_SRC c
+GLuint vboName;
+glGenBuffers(1, &vboName);
+glBindBuffer(GL_ARRAY_BUFFER, vboName);
+glBufferData(GL_ARRAY_BUFFER, ...);
+#+END_SRC
+
+Notice that we created a new buffer (which gives us a unique identifier), and
+then we /bound/ that name to the special =GL_ARRAY_BUFFER= location. Next, to upload
+data, we upload to whatever is in =GL_ARRAY_BUFFER=. This is horendously stateful,
+and it becomes a pain to manage exactly what state is where.
+
+However, this state machine is more problematic than being a mere nuisance - it
+can kill performance. Every time you make state transitions, the graphics driver
+/might/ need to do something. One thing it will certainly do is some validation to
+ensure that state transitions are appropriate. Depending on which state changes
+you perform, you can quickly kill performance. While it varies between hardware
+and drivers, we can roughly expect a shader program switch or a texture unit
+switch to be a very expensive operation. For this reason, traditionally one
+would batch common state changes together.
+
+To illustrate this point, consider an arbitrary but realistic scene. In this
+scene, we will probably have a bunch of geometry that is all made of the same
+material - concrete walls, some wooden objects, some plastic objects, etc. To
+render this efficiently we have to traverse the scene in a particular fashion to
+minimise state changes - drawing all concrete first, then all wood, and so on.
+
+All of this is rather tedious, and fortunately - it doesn't have to be this way.
+
+
+* Extended OpenGL 4.5
+
+OpenGL 4.5 begins to give us the tools to do things differently. In this
+project, I use some modern functionality to write cleaner, more efficient code:
+
+** Direct state access
+
+Direct state access (DSA) made it into OpenGL core 4.5, and it removes a lot of
+the pain of dealing with state. With DSA, we can interact directly with OpenGL
+objects, without having to bind them to targets. The previous example of
+uploading vertex data can be rewritten as:
+
+#+BEGIN_SRC c
+GLuint vboName;
+glCreateBuffers(1, &vboName);
+glBufferData(vboName, ...);
+#+END_SRC
+
+making it clear that we are uploading data to =vboName=, not whatever happens to
+be bound to =GL_ARRAY_BUFFER=.
+
+A lot of OpenGL was already heading in this direction - vertex array objects,
+programs, samplers, query objects, and a few other things /only/ give you direct
+state access, so it's nice to have a consistent interface.
+
+
+** ARB_bindless_texture
+
+Texture changes are frequent in Quake maps, and this isn't surprising, Quake
+derives almost all of its detail from the textures themselves (this engine
+predated the programmable pipeline). Thus to render efficiently, we want to
+minimise texture state changes. What better way to minimise them than to
+eliminate them completely!
+
+With ARB_bindless_texture, we now have the ability to access the underlying
+pointer to a texture name directly in GPU memory. This 64 pointer can be passed
+directly into fragment shaders to sample from a particular texture, with no need
+to bind a texture to a texture unit on the GPU.
+
+
+** Shader storage buffer objects
+
+Another technique used to minimise state changes is to simply ship the entire
+set of possible states to the GPU. Shader storage buffer objects (SSBOs)
+essentially give us a way to =malloc= arbitrary memory ranges in the GPU, and
+access the from the shader. In this project, I upload all material information
+and texture handles using SSBOs.
+
+
+** Multi-draw indirect
+
+In previous versions of OpenGL, you draw parts of geometry by dispatching a draw
+call. A draw call is essentially an instruction to draw N triangles (or a few
+other forms) from currently bound buffers. A map will consistent of ranges of
+triangles, each with some common properties such as materials and associated
+state.
+
+In OpenGL 4.3, we gained a new way to draw called "indirect drawing". With
+indirect drawing, we essentially build up an array of draw commands, and then
+dispatch the entire array to the GPU at once.
+
+With the ARB_shader_draw_parameters, we get a new shader parameter - =gl_DrawID= -
+which gives us the index of the draw call we are currently working with. We can
+then use this index as an index into other data structures to shade the
+triangles appropriately.
+
+* Putting it all together
+
+So, how do we combine these lovely features into something that can draw Quake
+3? First, let's take a look at the format of Quake 3 levels.
+
+** A brief look at Quake 3 rendering
+
+A Quake 3 level - a =.bsp= file - consists of several arrays of information:
+
+1. An array of vertices. Each vertex contains a position, normal, and UV
+   coordinates for both diffuse textures and the light map texture.
+
+2. An array of textures. A texture in the =.bsp= file is just a name, and may
+   refer to a texture image, or a Quake 3 shader.
+
+3. An array of 128x128 light map textures.
+
+3. An array of faces. A face contains:
+
+   - A list of triangles, indexing into the vertices array.
+   - An index into the textures array.
+   - An index into the light maps array.
+
+Thus rendering a Quake 3 map is essentially an exercise in indirection - we take
+the list of faces, and for each face draw a list of vertices, with a particular
+texture and lightmap. (This is only slightly handwaving, for less handwaving
+read the source).
+
+But what about texturing? Quake 3 comes with a description of shaders, which are
+essentially passes in a fixed function pipeline. A shader can specify multiple
+passes, each of which can sample from a texture and blend with previous passes.
+A shader will typically sample from the lightmap texture, and then blend over
+multiple diffuse textures over the top to provide the illusion of lighting.
+
+
+** Quake 3 shaders as GLSL shaders
+
+Quake 3 was clearly built for multi-pass rendering, though the engine itself
+does contain an optimisation phase to try and use multiple texture units and
+perform as few passes as possible.
+
+In this work, we have a single GLSL shader that is capable of rendering multiple
+passes.
+
+Each Quake 3 shader is compiled down to a series of passes. Each pass is
+described as:
+
+#+BEGIN_SRC glsl
+struct Pass {
+  int sourceFactors[5];
+  int destFactors[5];
+  layout (bindless_sampler) sampler2D diffuseTexture;
+  int lightMap;
+};
+#+END_SRC
+
+The pass mentions a bindless texture to use as a diffuse texture, and contains
+two 5-dimensional arrays of "blending" factors. This array gives us the ability
+to emulate =glBlendFunc= to blend each pass together.
+
+Next, we take each shader in the Quake 3 resources, and compile them into a list
+of passes. This list of passes can be uploaded directly to the GPU through
+shader storage buffer objects. I use the same indirection techinques in the
+Quake 3 BSP file, and work with two arrays:
+
+#+BEGIN_SRC glsl
+struct Material {
+  int nPasses;
+  int firstPass;
+};
+
+layout (binding = 0) buffer Materials {
+  Material materials[];
+};
+
+layout (binding = 1, std430) buffer Passes {
+  Pass passes[];
+};
+#+END_SRC
+
+First we have an array of =Material= values, where each =Material= gives us an offset
+into the =passes= array, and a count of how many passes to apply.
+
+
+** A single draw call
+
+With all rendering information on the GPU, it's now just a case of throwing
+everything at the GPU and having it work out what to do. The "faces" array in
+the BSP file is essentially a list of draw commands, so we just map each of
+these to an actual draw command, and dispatch the whole lot with
+=glMultiDrawElementsIndirect=. The final piece of the puzzle is to associate each
+draw call with a material. One more SSBO is used for this, which carries an
+index into the =materials= array, along with a =lightmap= to sample from:
+
+#+BEGIN_SRC glsl
+struct DrawInfo {
+  int materialIndex;
+  int lightMapIndex;
+};
+
+layout (binding = 2) buffer DrawInfos {
+  DrawInfo faceDrawInfos[];
+};
+
+layout (binding = 3) buffer LightMaps {
+  layout (bindless_sampler) sampler2D lightMaps[];
+};
+#+END_SRC
+
+The shader can now resolve all the data it needs from just the =gl_DrawID=:
+
+#+BEGIN_SRC glsl
+  DrawInfo di = faceDrawInfos[drawId]; // gl_DrawID supplied from the vertex shader
+  Material m = materials[di.materialIndex];
+
+  result = vec4(0);
+
+  vec4 lightMap = texture2D(lightMaps[di.lightMapIndex], v_texCoord_lm);
+
+  for (int i = 0; i < m.nPasses; i++) {
+    Pass p = passes[m.firstPass + i];
+    ...
+  }
+#+END_SRC
