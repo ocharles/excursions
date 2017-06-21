@@ -6,22 +6,24 @@
 
 module Main where
 
-import Data.Word
-import Data.Bits
 import Codec.Picture
 import Codec.Picture.Types
+import Control.Applicative
 import Control.Concurrent
 import Control.Monad
 import Control.Monad.Catch
 import Control.Monad.IO.Class
 import Control.Monad.Managed hiding (with)
+import Data.Bits
 import Data.ByteString.Char8 (unpack)
 import Data.Foldable (for_, traverse_, toList)
-import Data.IORef (IORef)
 import qualified Data.IORef
+import Data.IORef (IORef)
 import Data.Int
+import Data.List
 import Data.Map (Map)
 import qualified Data.Map.Strict as Map
+import Data.Maybe
 import Data.Monoid
 import qualified Data.Sequence as Seq
 import Data.StateVar
@@ -30,6 +32,7 @@ import Data.Traversable
 import qualified Data.Vector.Generic as GV
 import qualified Data.Vector.Storable as V
 import qualified Data.Vector.Storable as Vector
+import Data.Word
 import Foreign.C.String
 import Foreign.Marshal.Alloc
 import Foreign.Marshal.Array
@@ -297,32 +300,42 @@ uploadMap
   :: (MonadIO m, MonadCatch m)
   => TextureManager -> ShaderRepository -> BSPFile -> m MapResources
 uploadMap textureManager shaderRepository bspFile = do
-  mapVertexArrayObject <-
-    uploadMapGeometry bspFile
-
-  mapDrawCalls <-
-    uploadDrawCalls drawCalls
-
-  mapPassesByTexture <-
-    uploadMapShaders textureManager shaderRepository bspFile
-
-  (mapMaterials, mapPasses) <-
-    uploadMaterials mapPassesByTexture
-
-  mapDrawInformation <-
-    uploadDrawInformation bspFile
-
-  mapLightMaps <-
-    uploadLightMaps bspFile
-
-  return MapResources
-    { mapNDrawCalls = fromIntegral (length drawCalls)
-    , ..
-    }
-
+  mapVertexArrayObject <- uploadMapGeometry bspFile
+  mapPassesByTexture <- uploadMapShaders textureManager shaderRepository bspFile
+  (mapMaterials, mapPasses) <- uploadMaterials mapPassesByTexture
+  mapDrawCalls <- uploadDrawCalls drawCalls
+  mapDrawInformation <- uploadDrawInformation sortedFaces
+  mapLightMaps <- uploadLightMaps bspFile
+  return MapResources {mapNDrawCalls = fromIntegral (length drawCalls), ..}
   where
-
-    drawCalls = facesToDrawCalls bspFile
+    sortedFaces =
+      sortOn
+        (\face ->
+           case lookupShader
+                  shaderRepository
+                  (unpack
+                     (getASCII
+                        (textureName
+                           (bspTextures bspFile GV.!
+                            fromIntegral (faceTexture face))))) of
+             Just shader -> sortShader shader
+             _ -> TCShader.Opaque)
+        (GV.toList $ bspFaces bspFile)
+    drawCalls = facesToDrawCalls sortedFaces
+    sortShader shader =
+      let sortExplicit = getLast (TCShader._sort shader)
+          sortFromBlending = do
+            guard
+              (any
+                 (\p -> isJust (getLast (TCShader._blendFunc p)))
+                 (TCShader._passes shader))
+            TCShader.SeeThrough <$
+              guard
+                (any
+                   (\p -> getAny (TCShader._depthWrite p))
+                   (TCShader._passes shader)) <|>
+              return TCShader.Blend0
+      in fromMaybe TCShader.Opaque (sortExplicit <|> sortFromBlending)
 
 
 uploadLightMaps
@@ -461,8 +474,8 @@ uploadMapGeometry bspData =
 
 {-| Translate individual faces in a BSP file into draw calls.
 -}
-facesToDrawCalls :: BSPFile -> [DrawElementsIndirectCommand]
-facesToDrawCalls bsp =
+facesToDrawCalls :: [Face] -> [DrawElementsIndirectCommand]
+facesToDrawCalls faces =
   map
     (\Face {..} ->
        DrawElementsIndirectCommand
@@ -472,7 +485,7 @@ facesToDrawCalls bsp =
        , deicBaseVertex = fromIntegral faceVertex
        , deicBaseInstance = 0
        })
-    (GV.toList (bspFaces bsp))
+    faces
 
 
 {-| Dispatch draw calls to render a map.
@@ -516,7 +529,6 @@ uploadMapShaders textureManager shaderRepository bspFile =
           t <-
             case getLast (TCShader._animMap pass) of
               Just (TCShader.AnimMap _ (path:_)) -> do
-                liftIO (print path)
                 loadTexture textureManager path `catch`
                   (\SomeException {} ->
                      loadTexture textureManager "test-texture.png")
@@ -618,9 +630,9 @@ instance Storable DrawInformation where
 {-| Upload draw information for all faces in a map.
 -}
 uploadDrawInformation
-  :: MonadIO m
-  => BSPFile -> m ShaderStorageBufferObject
-uploadDrawInformation bsp =
+  :: (MonadIO m)
+  => [Face] -> m ShaderStorageBufferObject
+uploadDrawInformation faces =
   liftIO $ do
     drawInfosBuffer <-
       alloca $ \ptr -> do
@@ -633,7 +645,7 @@ uploadDrawInformation bsp =
                { materialIndex = getLittleEndian (faceTexture face)
                , lightMapIndex = getLittleEndian (faceLMIndex face)
                })
-            (GV.toList $ bspFaces bsp)
+            faces
     withArray drawInfos $ \ptr ->
       glNamedBufferData
         drawInfosBuffer
