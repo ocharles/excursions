@@ -805,7 +805,7 @@ main =
     liftIO $ withCString "a_uv_1" (glBindAttribLocation mapProgram 2)
     liftIO $
       with
-        (perspective 1.047 (800 / 600) 0.1 5000 !*!
+        (perspective 1.047 (1700 / 900) 0.1 5000 !*!
          lookAt (V3 680 100 (-100)) (V3 680 100 (-101)) (V3 0 1 0) :: M44 Float)
         (glUniformMatrix4fv 0 1 GL_TRUE . castPtr)
 
@@ -837,7 +837,8 @@ createOpenGLWindow windowTitle = do
             SDL.defaultOpenGL { SDL.glProfile = SDL.Core SDL.Debug 4 5 }
 
           windowConfig =
-            SDL.defaultWindow { SDL.windowOpenGL = Just openGLConfig }
+            SDL.defaultWindow { SDL.windowOpenGL = Just openGLConfig
+                              , SDL.windowInitialSize = V2 1700 900}
 
       in  SDL.createWindow windowTitle windowConfig
 
