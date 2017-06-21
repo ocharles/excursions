@@ -287,10 +287,12 @@ data MapResources = MapResources
   { mapVertexArrayObject :: VertexArrayObject
   , mapMaterials :: ShaderStorageBufferObject
   , mapPasses :: ShaderStorageBufferObject
-  , mapDrawCalls :: DrawIndirectBufferObject
-  , mapDrawInformation :: ShaderStorageBufferObject
-  , mapNDrawCalls :: GLsizei
   , mapLightMaps :: ShaderStorageBufferObject
+  , bspFile :: BSPFile
+  , mapDrawBufferData :: Ptr DrawElementsIndirectCommand
+  , mapDrawInformationData :: Ptr DrawInformation
+  , mapDrawBuffer :: DrawIndirectBufferObject
+  , mapDrawInformation :: ShaderStorageBufferObject
   }
 
 
@@ -303,39 +305,43 @@ uploadMap textureManager shaderRepository bspFile = do
   mapVertexArrayObject <- uploadMapGeometry bspFile
   mapPassesByTexture <- uploadMapShaders textureManager shaderRepository bspFile
   (mapMaterials, mapPasses) <- uploadMaterials mapPassesByTexture
-  mapDrawCalls <- uploadDrawCalls drawCalls
-  mapDrawInformation <- uploadDrawInformation sortedFaces
   mapLightMaps <- uploadLightMaps bspFile
-  return MapResources {mapNDrawCalls = fromIntegral (length drawCalls), ..}
-  where
-    sortedFaces =
-      sortOn
-        (\face ->
-           case lookupShader
-                  shaderRepository
-                  (unpack
-                     (getASCII
-                        (textureName
-                           (bspTextures bspFile GV.!
-                            fromIntegral (faceTexture face))))) of
-             Just shader -> sortShader shader
-             _ -> TCShader.Opaque)
-        (GV.toList $ bspFaces bspFile)
-    drawCalls = facesToDrawCalls sortedFaces
-    sortShader shader =
-      let sortExplicit = getLast (TCShader._sort shader)
-          sortFromBlending = do
-            guard
-              (any
-                 (\p -> isJust (getLast (TCShader._blendFunc p)))
-                 (TCShader._passes shader))
-            TCShader.SeeThrough <$
-              guard
-                (any
-                   (\p -> getAny (TCShader._depthWrite p))
-                   (TCShader._passes shader)) <|>
-              return TCShader.Blend0
-      in fromMaybe TCShader.Opaque (sortExplicit <|> sortFromBlending)
+
+  mapDrawBufferName <-
+    liftIO $
+    alloca $ \ptr -> do
+      glCreateBuffers 1 ptr
+      peek ptr
+  mapDrawBufferData <-
+    fmap castPtr $ do
+      let bufferLength =
+            fromIntegral
+              (length (bspFaces bspFile) *
+               sizeOf (undefined :: DrawElementsIndirectCommand))
+          flags =
+            GL_MAP_WRITE_BIT .|. GL_MAP_COHERENT_BIT .|. GL_MAP_PERSISTENT_BIT
+      glNamedBufferStorage mapDrawBufferName bufferLength nullPtr flags
+      glMapNamedBufferRange mapDrawBufferName 0 bufferLength flags
+  let mapDrawBuffer = DrawIndirectBufferObject mapDrawBufferName
+
+  mapDrawInformationName <-
+    liftIO $
+    alloca $ \ptr -> do
+      glCreateBuffers 1 ptr
+      peek ptr
+  mapDrawInformationData <-
+    fmap castPtr $ do
+      let bufferLength =
+            fromIntegral
+              (length (bspFaces bspFile) *
+               sizeOf (undefined :: DrawElementsIndirectCommand))
+          flags =
+            GL_MAP_WRITE_BIT .|. GL_MAP_COHERENT_BIT .|. GL_MAP_PERSISTENT_BIT
+      glNamedBufferStorage mapDrawInformationName bufferLength nullPtr flags
+      glMapNamedBufferRange mapDrawInformationName 0 bufferLength flags
+  let mapDrawInformation = ShaderStorageBufferObject mapDrawInformationName
+
+  return MapResources {..}
 
 
 uploadLightMaps
@@ -490,22 +496,60 @@ facesToDrawCalls faces =
 
 {-| Dispatch draw calls to render a map.
 -}
-drawMap :: MonadIO m => MapResources -> m ()
-drawMap MapResources {..} = do
+drawMap :: MonadIO m => ShaderRepository -> MapResources -> m ()
+drawMap shaderRepository MapResources {..} = do
   bindVertexArray mapVertexArrayObject
-  bindDrawIndirectBuffer mapDrawCalls
-
   bindShaderStorageBufferObjectToIndex 0 mapMaterials
   bindShaderStorageBufferObjectToIndex 1 mapPasses
-  bindShaderStorageBufferObjectToIndex 2 mapDrawInformation
   bindShaderStorageBufferObjectToIndex 3 mapLightMaps
-
-  glMultiDrawElementsIndirect
-    GL_TRIANGLES
-    GL_UNSIGNED_INT
-    nullPtr
-    mapNDrawCalls
-    0
+  bindShaderStorageBufferObjectToIndex 2 mapDrawInformation
+  bindDrawIndirectBuffer mapDrawBuffer
+  glDisable GL_BLEND
+  drawFaces $
+    filter ((<= TCShader.Opaque) . faceToLayer) sortedFaces
+  glEnable GL_BLEND
+  glBlendFunc GL_ONE GL_ONE
+  drawFaces $ filter ((> TCShader.Opaque) . faceToLayer) sortedFaces
+  where
+    drawFaces faces =
+      liftIO $ do
+        glFinish
+        pokeArray mapDrawBufferData (facesToDrawCalls faces)
+        pokeArray mapDrawInformationData $
+          map
+            (\face ->
+               DrawInformation
+               { materialIndex = getLittleEndian (faceTexture face)
+               , lightMapIndex = getLittleEndian (faceLMIndex face)
+               })
+            faces
+        glMultiDrawElementsIndirect
+          GL_TRIANGLES
+          GL_UNSIGNED_INT
+          nullPtr
+          (fromIntegral (length faces))
+          0
+    faceToLayer face =
+      case lookupShader
+             shaderRepository
+             (unpack
+                (getASCII
+                   (textureName
+                      (bspTextures bspFile GV.! fromIntegral (faceTexture face))))) of
+        Just shader -> sortShader shader
+        _ -> TCShader.Opaque
+    sortedFaces = sortOn faceToLayer (GV.toList $ bspFaces bspFile)
+    sortShader shader =
+      case getLast (TCShader._sort shader) of
+        Just layer -> layer
+        Nothing ->
+          case toList (TCShader._passes shader) of
+            (p:_) ->
+              case getLast (TCShader._blendFunc p) of
+                Just (TCShader.One, TCShader.Zero) -> TCShader.Opaque
+                Just _ -> TCShader.Blend0
+                Nothing -> TCShader.Opaque
+            _ -> TCShader.Opaque
 
 
 {-| Upload all (referenced) shaders in a map.
@@ -627,34 +671,6 @@ instance Storable DrawInformation where
     pokeByteOff (castPtr ptr) 4 b
 
 
-{-| Upload draw information for all faces in a map.
--}
-uploadDrawInformation
-  :: (MonadIO m)
-  => [Face] -> m ShaderStorageBufferObject
-uploadDrawInformation faces =
-  liftIO $ do
-    drawInfosBuffer <-
-      alloca $ \ptr -> do
-        glCreateBuffers 1 ptr
-        peek ptr
-    let drawInfos =
-          map
-            (\face ->
-               DrawInformation
-               { materialIndex = getLittleEndian (faceTexture face)
-               , lightMapIndex = getLittleEndian (faceLMIndex face)
-               })
-            faces
-    withArray drawInfos $ \ptr ->
-      glNamedBufferData
-        drawInfosBuffer
-        (fromIntegral (sizeOf (head drawInfos) * length drawInfos))
-        (castPtr ptr)
-        GL_STATIC_DRAW
-    return (ShaderStorageBufferObject drawInfosBuffer)
-
-
 
 -- VERTEX ARRAY OBJECTS
 
@@ -687,24 +703,6 @@ bindShaderStorageBufferObjectToIndex n (ShaderStorageBufferObject m) =
 
 newtype DrawIndirectBufferObject =
   DrawIndirectBufferObject GLuint
-
-
-uploadDrawCalls
-  :: MonadIO m
-  => [DrawElementsIndirectCommand] -> m DrawIndirectBufferObject
-uploadDrawCalls drawCalls =
-  liftIO $ do
-    bufferObject <-
-      alloca $ \ptr -> do
-        glCreateBuffers 1 ptr
-        peek ptr
-    withArray drawCalls $ \ptr ->
-      glNamedBufferData
-        bufferObject
-        (fromIntegral (sizeOf (head drawCalls) * length drawCalls))
-        (castPtr ptr)
-        GL_STATIC_DRAW
-    return (DrawIndirectBufferObject bufferObject)
 
 
 bindDrawIndirectBuffer :: MonadIO m => DrawIndirectBufferObject -> m ()
@@ -799,7 +797,7 @@ main =
 
       linkProgram [vertexShader, fragmentShader]
 
-    glClearColor 1 0 0 1
+    glClearColor 0 0 0 1
     glUseProgram mapProgram
     liftIO $ withCString "a_position" (glBindAttribLocation mapProgram 0)
     liftIO $ withCString "a_normal" (glBindAttribLocation mapProgram 3)
@@ -817,9 +815,9 @@ main =
     forever $ do
       SDL.pollEvents
 
-      glClear GL_DEPTH_BUFFER_BIT
+      glClear (GL_DEPTH_BUFFER_BIT .|. GL_COLOR_BUFFER_BIT)
 
-      drawMap mapResources
+      drawMap shaderRepository mapResources
 
       SDL.glSwapWindow window
 
