@@ -191,6 +191,18 @@ uploadImage internalFormat imageFormat (Image width height pixels) =
         GL_UNSIGNED_BYTE
         (castPtr imageData)
 
+    glGenerateTextureMipmap name
+
+    glTextureParameteri
+      name
+      GL_TEXTURE_MIN_FILTER
+      GL_LINEAR_MIPMAP_LINEAR
+
+    glTextureParameteri
+      name
+      GL_TEXTURE_MAG_FILTER
+      GL_LINEAR
+
     return (TextureObject name)
 
 
