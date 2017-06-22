@@ -495,41 +495,71 @@ facesToDrawCalls faces =
     faces
 
 
+
 {-| Dispatch draw calls to render a map.
 -}
 drawMap :: MonadIO m => ShaderRepository -> MapResources -> m ()
-drawMap shaderRepository MapResources {..} = do
-  bindVertexArray mapVertexArrayObject
-  bindShaderStorageBufferObjectToIndex 0 mapMaterials
-  bindShaderStorageBufferObjectToIndex 1 mapPasses
-  bindShaderStorageBufferObjectToIndex 3 mapLightMaps
-  bindShaderStorageBufferObjectToIndex 2 mapDrawInformation
-  bindDrawIndirectBuffer mapDrawBuffer
-  glDisable GL_BLEND
-  drawFaces $
-    filter ((<= TCShader.Opaque) . faceToLayer) sortedFaces
-  glEnable GL_BLEND
-  glBlendFunc GL_ONE GL_ONE
-  drawFaces $ filter ((> TCShader.Opaque) . faceToLayer) sortedFaces
+drawMap shaderRepository MapResources {..} =
+  go sortedFaces
+
   where
-    drawFaces faces =
-      liftIO $ do
-        glFinish
-        pokeArray mapDrawBufferData (facesToDrawCalls faces)
-        pokeArray mapDrawInformationData $
-          map
-            (\face ->
-               DrawInformation
-               { materialIndex = getLittleEndian (faceTexture face)
-               , lightMapIndex = getLittleEndian (faceLMIndex face)
-               })
-            faces
-        glMultiDrawElementsIndirect
-          GL_TRIANGLES
-          GL_UNSIGNED_INT
-          nullPtr
-          (fromIntegral (length faces))
-          0
+
+    go [] = return ()
+    go (f:fs) = do
+      let (ok, later) = span (\g -> faceState f == faceState g) fs
+          (src, dst) = faceState f
+      glBlendFunc src dst
+      upload (f:ok)
+      drawFaces 0 (fromIntegral (length ok + 1))
+      go later
+
+    upload faces = liftIO $ do
+      glFinish
+      liftIO $ pokeArray mapDrawBufferData (facesToDrawCalls faces)
+      liftIO $ pokeArray mapDrawInformationData $
+        map
+          (\face ->
+              DrawInformation
+              { materialIndex = getLittleEndian (faceTexture face)
+              , lightMapIndex = getLittleEndian (faceLMIndex face)
+              })
+          faces
+
+
+    faceState face =
+      case lookupShader
+             shaderRepository
+             (unpack
+                (getASCII
+                   (textureName
+                      (bspTextures bspFile GV.! fromIntegral (faceTexture face))))) of
+        Just shader ->
+            case toList (TCShader._passes shader) of
+              [] -> (GL_ONE, GL_ZERO)
+              (p:_) ->
+                case getLast (TCShader._blendFunc p) of
+                  Nothing -> (GL_ONE, GL_ZERO)
+                  Just (src, dest) -> (toGL src, toGL dest)
+        _ -> (GL_ONE, GL_ZERO)
+
+    toGL TCShader.One              = GL_ONE
+    toGL TCShader.Zero             = GL_ZERO
+    toGL TCShader.DstColor         = GL_DST_COLOR
+    toGL TCShader.SrcAlpha         = GL_SRC_ALPHA
+    toGL TCShader.OneMinusSrcAlpha = GL_ONE_MINUS_SRC_ALPHA
+    toGL TCShader.OneMinusDstAlpha = GL_ONE_MINUS_DST_ALPHA
+    toGL TCShader.OneMinusSrcColor = GL_ONE_MINUS_SRC_COLOR
+    toGL TCShader.OneMinusDstColor = GL_ONE_MINUS_DST_COLOR
+    toGL TCShader.SrcColor         = GL_SRC_COLOR
+
+    drawFaces offset count =
+      glMultiDrawElementsIndirect
+        GL_TRIANGLES
+        GL_UNSIGNED_INT
+        (nullPtr `plusPtr` (offset * sizeOf (undefined :: DrawElementsIndirectCommand)))
+        count
+        0
+
     faceToLayer face =
       case lookupShader
              shaderRepository
@@ -539,10 +569,15 @@ drawMap shaderRepository MapResources {..} = do
                       (bspTextures bspFile GV.! fromIntegral (faceTexture face))))) of
         Just shader -> sortShader shader
         _ -> TCShader.Opaque
-    sortedFaces = sortOn faceToLayer (GV.toList $ bspFaces bspFile)
+
+    sortedFaces =
+      sortOn faceToLayer (GV.toList $ bspFaces bspFile)
+
     sortShader shader =
       case getLast (TCShader._sort shader) of
-        Just layer -> layer
+        Just layer ->
+          layer
+
         Nothing ->
           case toList (TCShader._passes shader) of
             (p:_) ->
@@ -812,6 +847,19 @@ main =
 
     glEnable GL_DEPTH_TEST
     glEnable GL_FRAMEBUFFER_SRGB
+
+    case mapResources of
+      MapResources{..} -> do
+        bindVertexArray mapVertexArrayObject
+
+        bindShaderStorageBufferObjectToIndex 0 mapMaterials
+        bindShaderStorageBufferObjectToIndex 1 mapPasses
+        bindShaderStorageBufferObjectToIndex 3 mapLightMaps
+        bindShaderStorageBufferObjectToIndex 2 mapDrawInformation
+
+        bindDrawIndirectBuffer mapDrawBuffer
+
+        glEnable GL_BLEND
 
     forever $ do
       SDL.pollEvents
