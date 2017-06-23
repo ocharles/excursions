@@ -282,10 +282,9 @@ data MapResources = MapResources
   , mapPasses :: ShaderStorageBufferObject
   , mapLightMaps :: ShaderStorageBufferObject
   , bspFile :: BSPFile
-  , mapDrawBufferData :: Ptr DrawElementsIndirectCommand
-  , mapDrawInformationData :: Ptr DrawInformation
   , mapDrawBuffer :: DrawIndirectBufferObject
   , mapDrawInformation :: ShaderStorageBufferObject
+  , sortedFaces :: [Face]
   }
 
 
@@ -295,44 +294,54 @@ uploadMap
   :: (MonadIO m, MonadCatch m)
   => TextureManager -> ShaderRepository -> BSPFile -> m MapResources
 uploadMap textureManager shaderRepository bspFile = do
-  mapVertexArrayObject <- uploadMapGeometry bspFile
-  mapPassesByTexture <- uploadMapShaders textureManager shaderRepository bspFile
-  (mapMaterials, mapPasses) <- uploadMaterials mapPassesByTexture
-  mapLightMaps <- uploadLightMaps bspFile
+  mapVertexArrayObject <-
+    uploadMapGeometry bspFile
 
-  mapDrawBufferName <-
-    liftIO $
-    alloca $ \ptr -> do
+  mapPassesByTexture <-
+    uploadMapShaders textureManager shaderRepository bspFile
+
+  (mapMaterials, mapPasses) <-
+    uploadMaterials mapPassesByTexture
+
+  mapLightMaps <-
+    uploadLightMaps bspFile
+
+  let sortedFaces =
+        sortOn (faceToLayer bspFile shaderRepository) (GV.toList $ bspFaces bspFile)
+
+  mapDrawBufferName <- liftIO $ do
+    name <- alloca $ \ptr -> do
       glCreateBuffers 1 ptr
       peek ptr
-  mapDrawBufferData <-
-    fmap castPtr $ do
-      let bufferLength =
-            fromIntegral
-              (length (bspFaces bspFile) *
-               sizeOf (undefined :: DrawElementsIndirectCommand))
-          flags =
-            GL_MAP_WRITE_BIT .|. GL_MAP_COHERENT_BIT .|. GL_MAP_PERSISTENT_BIT
-      glNamedBufferStorage mapDrawBufferName bufferLength nullPtr flags
-      glMapNamedBufferRange mapDrawBufferName 0 bufferLength flags
-  let mapDrawBuffer = DrawIndirectBufferObject mapDrawBufferName
+    withArray (facesToDrawCalls sortedFaces) $ \ptr ->
+      glNamedBufferData
+        name
+        (fromIntegral (length sortedFaces * sizeOf (undefined :: DrawElementsIndirectCommand)))
+        (castPtr ptr)
+        GL_STATIC_DRAW
+    return name
 
-  mapDrawInformationName <-
-    liftIO $
-    alloca $ \ptr -> do
+  mapDrawInformationName <- liftIO $ do
+    name <- alloca $ \ptr -> do
       glCreateBuffers 1 ptr
       peek ptr
-  mapDrawInformationData <-
-    fmap castPtr $ do
-      let bufferLength =
-            fromIntegral
-              (length (bspFaces bspFile) *
-               sizeOf (undefined :: DrawElementsIndirectCommand))
-          flags =
-            GL_MAP_WRITE_BIT .|. GL_MAP_COHERENT_BIT .|. GL_MAP_PERSISTENT_BIT
-      glNamedBufferStorage mapDrawInformationName bufferLength nullPtr flags
-      glMapNamedBufferRange mapDrawInformationName 0 bufferLength flags
+    withArray
+        (map
+          (\face ->
+              DrawInformation
+              { materialIndex = getLittleEndian (faceTexture face)
+              , lightMapIndex = getLittleEndian (faceLMIndex face)
+              })
+          sortedFaces) $ \ptr ->
+      glNamedBufferData
+        name
+        (fromIntegral (length sortedFaces * sizeOf (undefined :: DrawInformation)))
+        (castPtr ptr)
+        GL_STATIC_DRAW
+    return name
+
   let mapDrawInformation = ShaderStorageBufferObject mapDrawInformationName
+      mapDrawBuffer = DrawIndirectBufferObject mapDrawBufferName
 
   return MapResources {..}
 
@@ -417,17 +426,50 @@ uploadMapGeometry bspData =
           (castPtr vData)
           GL_STATIC_DRAW
         return vbo
+
     vao <-
       alloca $ \ptr -> do
         glGenVertexArrays 1 ptr
         peek ptr
+
+    faceIndices <- liftIO $ do
+      faceIndices <- alloca $ \ptr -> do
+        glCreateBuffers 1 ptr
+        peek ptr
+      let indices = map fst (zip [0 :: GLuint .. ] (GV.toList $ bspFaces bspData))
+      withArray indices $ \indexData ->
+        glNamedBufferData
+          faceIndices
+          (fromIntegral (length indices * sizeOf (0 :: GLuint)))
+          (castPtr indexData)
+          GL_STATIC_DRAW
+      return faceIndices
+
     glBindVertexArray vao
+
     glVertexArrayVertexBuffer
       vao
       0
       vbo
       0
       (fromIntegral (sizeOf (undefined :: Parser.Vertex)))
+
+    glEnableVertexArrayAttrib vao 4
+
+    glBindBuffer GL_ARRAY_BUFFER faceIndices
+
+    glVertexAttribIPointer
+      4
+      1
+      GL_UNSIGNED_INT
+      (fromIntegral (sizeOf (0 :: GLuint)))
+      nullPtr
+
+    glVertexArrayBindingDivisor
+      vao
+      4
+      1
+
     configureVertexArrayAttributes
       vao
       [ VertexAttribFormat
@@ -475,15 +517,16 @@ uploadMapGeometry bspData =
 -}
 facesToDrawCalls :: [Face] -> [DrawElementsIndirectCommand]
 facesToDrawCalls faces =
-  map
-    (\Face {..} ->
+  zipWith
+    (\i Face {..} ->
        DrawElementsIndirectCommand
        { deicCount = fromIntegral faceNMeshVerts
        , deicInstanceCount = 1
        , deicFirstIndex = fromIntegral faceMeshVert
        , deicBaseVertex = fromIntegral faceVertex
-       , deicBaseInstance = 0
+       , deicBaseInstance = i
        })
+    [0..]
     faces
 
 
@@ -492,31 +535,17 @@ facesToDrawCalls faces =
 -}
 drawMap :: MonadIO m => ShaderRepository -> MapResources -> m ()
 drawMap shaderRepository MapResources {..} =
-  go sortedFaces
+  go (zip [0..] sortedFaces)
 
   where
 
     go [] = return ()
-    go (f:fs) = do
-      let (ok, later) = span (\g -> faceState f == faceState g) fs
+    go ((i, f):fs) = do
+      let (ok, later) = span (\(_, g) -> faceState f == faceState g) fs
           (src, dst) = faceState f
       glBlendFunc src dst
-      upload (f:ok)
-      drawFaces 0 (fromIntegral (length ok + 1))
+      drawFaces i (fromIntegral (length ok + 1))
       go later
-
-    upload faces = liftIO $ do
-      glFinish
-      liftIO $ pokeArray mapDrawBufferData (facesToDrawCalls faces)
-      liftIO $ pokeArray mapDrawInformationData $
-        map
-          (\face ->
-              DrawInformation
-              { materialIndex = getLittleEndian (faceTexture face)
-              , lightMapIndex = getLittleEndian (faceLMIndex face)
-              })
-          faces
-
 
     faceState face =
       case lookupShader
@@ -544,40 +573,15 @@ drawMap shaderRepository MapResources {..} =
     toGL TCShader.OneMinusDstColor = GL_ONE_MINUS_DST_COLOR
     toGL TCShader.SrcColor         = GL_SRC_COLOR
 
-    drawFaces offset count =
+    drawFaces offset count = do
       glMultiDrawElementsIndirect
         GL_TRIANGLES
         GL_UNSIGNED_INT
         (nullPtr `plusPtr` (offset * sizeOf (undefined :: DrawElementsIndirectCommand)))
-        count
+        (fromIntegral count)
         0
 
-    faceToLayer face =
-      case lookupShader
-             shaderRepository
-             (unpack
-                (getASCII
-                   (textureName
-                      (bspTextures bspFile GV.! fromIntegral (faceTexture face))))) of
-        Just shader -> sortShader shader
-        _ -> TCShader.Opaque
 
-    sortedFaces =
-      sortOn faceToLayer (GV.toList $ bspFaces bspFile)
-
-    sortShader shader =
-      case getLast (TCShader._sort shader) of
-        Just layer ->
-          layer
-
-        Nothing ->
-          case toList (TCShader._passes shader) of
-            (p:_) ->
-              case getLast (TCShader._blendFunc p) of
-                Just (TCShader.One, TCShader.Zero) -> TCShader.Opaque
-                Just _ -> TCShader.Blend0
-                Nothing -> TCShader.Opaque
-            _ -> TCShader.Opaque
 
 
 {-| Upload all (referenced) shaders in a map.
@@ -827,10 +831,7 @@ main =
 
     glClearColor 0 0 0 1
     glUseProgram mapProgram
-    liftIO $ withCString "a_position" (glBindAttribLocation mapProgram 0)
-    liftIO $ withCString "a_normal" (glBindAttribLocation mapProgram 3)
-    liftIO $ withCString "a_uv_0" (glBindAttribLocation mapProgram 1)
-    liftIO $ withCString "a_uv_1" (glBindAttribLocation mapProgram 2)
+
     liftIO $
       with
         (perspective 1.047 (1700 / 900) 0.1 5000 !*!
@@ -1031,3 +1032,25 @@ configureVertexArrayAttributes vao formats =
 
 newIORef :: MonadIO m => a -> m (IORef a)
 newIORef = liftIO . Data.IORef.newIORef
+
+faceToLayer bspFile shaderRepository face =
+  case lookupShader
+         shaderRepository
+         (unpack
+            (getASCII
+               (textureName
+                  (bspTextures bspFile GV.! fromIntegral (faceTexture face))))) of
+    Just shader -> sortShader shader
+    _ -> TCShader.Opaque
+
+sortShader shader =
+  case getLast (TCShader._sort shader) of
+    Just layer -> layer
+    Nothing ->
+      case toList (TCShader._passes shader) of
+        (p:_) ->
+          case getLast (TCShader._blendFunc p) of
+            Just (TCShader.One, TCShader.Zero) -> TCShader.Opaque
+            Just _ -> TCShader.Blend0
+            Nothing -> TCShader.Opaque
+        _ -> TCShader.Opaque

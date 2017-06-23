@@ -36,7 +36,7 @@ layout (binding = 3) buffer LightMaps {
   layout (bindless_sampler) sampler2D lightMaps[];
 };
 
-flat in int drawId;
+flat in uint drawId;
 
 in vec2 v_texCoord;
 in vec2 v_texCoord_lm;
