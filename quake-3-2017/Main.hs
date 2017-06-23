@@ -232,14 +232,6 @@ instance Storable Material where
     pokeByteOff (castPtr ptr) (sizeOf a) b
 
 
--- {-| Given a type-checked Quake 3 shader, compile this down to an OpenGL
--- material.
-
--- This will also load any required textures
--- -}
--- compileShader :: TextureManager ->
-
-
 
 -- SHADER REPOSITORY
 
