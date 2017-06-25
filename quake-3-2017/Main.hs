@@ -6,6 +6,7 @@
 
 module Main where
 
+import Camera
 import Codec.Picture
 import Codec.Picture.Types
 import Control.Applicative
@@ -50,6 +51,8 @@ import Linear.Projection
 import Parser
 import qualified Quake3.Shader.Parser as ParsedShader
 import qualified Quake3.Shader.TypeCheck as TCShader
+import Reactive.Banana
+import Reactive.Banana.Frameworks
 import qualified SDL
 import System.Directory
 import System.FilePath
@@ -840,6 +843,7 @@ main =
 
     glEnable GL_DEPTH_TEST
     glEnable GL_FRAMEBUFFER_SRGB
+    glEnable GL_BLEND
 
     case mapResources of
       MapResources{..} -> do
@@ -852,16 +856,40 @@ main =
 
         bindDrawIndirectBuffer mapDrawBuffer
 
-        glEnable GL_BLEND
+    (sdlEventAH, onSdlEvent) <- liftIO newAddHandler
+    (renderAH, onRender) <- liftIO newAddHandler
+
+    let network = do
+          render <- fromAddHandler renderAH
+          sdlEvent <- fromAddHandler sdlEventAH
+
+          camera <-
+            cameraViewMatrix (V3 680 100 (-100))
+                             (WalkCamera 1 <$ sdlEvent)
+
+          reactimate $
+            renderScene <$> pure shaderRepository
+                        <*> pure mapResources
+                        <*> camera
+                        <@ render
+
+    liftIO (compile network >>= actuate)
 
     forever $ do
-      SDL.pollEvents
-
-      glClear (GL_DEPTH_BUFFER_BIT .|. GL_COLOR_BUFFER_BIT)
-
-      drawMap shaderRepository mapResources
-
+      SDL.pollEvents >>= mapM_ (liftIO . onSdlEvent)
+      liftIO (onRender ())
       SDL.glSwapWindow window
+
+
+renderScene shaderRepository mapResources viewMatrix = do
+  glClear (GL_DEPTH_BUFFER_BIT .|. GL_COLOR_BUFFER_BIT)
+
+  with
+    (perspective 1.047 (1700 / 900) 0.1 5000 !*! viewMatrix :: M44 Float)
+    (glUniformMatrix4fv 0 1 GL_TRUE . castPtr)
+
+  drawMap shaderRepository mapResources
+
 
 
 createOpenGLWindow windowTitle = do
