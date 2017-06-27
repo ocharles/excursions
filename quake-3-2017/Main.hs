@@ -6,11 +6,8 @@
 
 module Main where
 
-import Camera
 import Codec.Picture
 import Codec.Picture.Types
-import Control.Applicative
-import Control.Concurrent
 import Control.Monad
 import Control.Monad.Catch
 import Control.Monad.IO.Class
@@ -26,8 +23,8 @@ import Data.Map (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe
 import Data.Monoid
-import qualified Data.Sequence as Seq
 import Data.StateVar
+import Data.Text (Text)
 import qualified Data.Text.IO as T
 import Data.Traversable
 import qualified Data.Vector.Generic as GV
@@ -39,21 +36,20 @@ import Foreign.Marshal.Alloc
 import Foreign.Marshal.Array
 import Foreign.Marshal.Utils
 import Foreign.Ptr
-import Foreign.Ptr (castPtr, nullPtr)
 import Foreign.Storable
-import Foreign.Storable (peek, sizeOf)
 import Graphics.GL.Core45
 import Graphics.GL.Ext.ARB.BindlessTexture
 import Graphics.GL.Ext.ARB.DebugOutput
 import Graphics.GL.Types
 import Linear
-import Linear.Projection
+import Logic
 import Parser
 import qualified Quake3.Shader.Parser as ParsedShader
 import qualified Quake3.Shader.TypeCheck as TCShader
 import Reactive.Banana
 import Reactive.Banana.Frameworks
 import qualified SDL
+import System.Clock
 import System.Directory
 import System.FilePath
 import Text.Megaparsec (parse)
@@ -259,7 +255,7 @@ loadAllShadersInDirectory directory = do
             Left e -> do
               putStrLn $ "Failed to parse " ++ p ++ ": " ++ show e
               return mempty
-            Right shaders -> do
+            Right shaders ->
               fmap mconcat $
                 for shaders $ \s -> do
                   let (typeChecked, warnings) = TCShader.tcShader s
@@ -361,7 +357,7 @@ uploadLightMaps BSPFile {bspLightMaps} = do
          let overBrightPixels :: V.Vector Word8
              overBrightPixels =
                V.fromList $
-               concat $
+               concat
                [ let overbright = 2
                      colours =
                        [ shiftL
@@ -439,7 +435,7 @@ uploadMapGeometry bspData =
       faceIndices <- alloca $ \ptr -> do
         glCreateBuffers 1 ptr
         peek ptr
-      let indices = map fst (zip [0 :: GLuint .. ] (GV.toList $ bspFaces bspData))
+      let indices = zipWith const [0 :: GLuint .. ] (GV.toList $ bspFaces bspData)
       withArray indices $ \indexData ->
         glNamedBufferData
           faceIndices
@@ -519,7 +515,7 @@ uploadMapGeometry bspData =
 {-| Translate individual faces in a BSP file into draw calls.
 -}
 facesToDrawCalls :: [Face] -> [DrawElementsIndirectCommand]
-facesToDrawCalls faces =
+facesToDrawCalls =
   zipWith
     (\i Face {..} ->
        DrawElementsIndirectCommand
@@ -530,7 +526,6 @@ facesToDrawCalls faces =
        , deicBaseInstance = i
        })
     [0..]
-    faces
 
 
 
@@ -576,7 +571,7 @@ drawMap shaderRepository MapResources {..} =
     toGL TCShader.OneMinusDstColor = GL_ONE_MINUS_DST_COLOR
     toGL TCShader.SrcColor         = GL_SRC_COLOR
 
-    drawFaces offset count = do
+    drawFaces offset count =
       glMultiDrawElementsIndirect
         GL_TRIANGLES
         GL_UNSIGNED_INT
@@ -607,7 +602,7 @@ uploadMapShaders textureManager shaderRepository bspFile =
               _ -> loadTexture textureManager "test-texture.png"
           t <-
             case getLast (TCShader._animMap pass) of
-              Just (TCShader.AnimMap _ (path:_)) -> do
+              Just (TCShader.AnimMap _ (path:_)) ->
                 loadTexture textureManager path `catch`
                   (\SomeException {} ->
                      loadTexture textureManager "test-texture.png")
@@ -858,29 +853,56 @@ main =
 
     (sdlEventAH, onSdlEvent) <- liftIO newAddHandler
     (renderAH, onRender) <- liftIO newAddHandler
+    (stepPhysicsAH, onStepPhysics) <- liftIO newAddHandler
 
     let network = do
           render <- fromAddHandler renderAH
           sdlEvent <- fromAddHandler sdlEventAH
+          stepPhysics <- fromAddHandler stepPhysicsAH
 
           camera <-
-            cameraViewMatrix (V3 680 100 (-100))
-                             (WalkCamera 1 <$ sdlEvent)
+            quake3 (fmap timeSpecToSeconds stepPhysics) sdlEvent
 
           reactimate $
             renderScene <$> pure shaderRepository
                         <*> pure mapResources
-                        <*> camera
+                        <*> fmap (fmap (fmap realToFrac)) camera
                         <@ render
 
     liftIO (compile network >>= actuate)
 
+    stopwatch <- newStopwatch
+
     forever $ do
       SDL.pollEvents >>= mapM_ (liftIO . onSdlEvent)
+      lapStopwatch stopwatch >>= liftIO . onStepPhysics
       liftIO (onRender ())
       SDL.glSwapWindow window
 
 
+data Stopwatch =
+  Stopwatch (IORef TimeSpec)
+
+
+newStopwatch :: MonadIO m => m Stopwatch
+newStopwatch =
+  liftIO (fmap Stopwatch (getTime Monotonic >>= newIORef))
+
+
+lapStopwatch :: MonadIO m => Stopwatch -> m TimeSpec
+lapStopwatch (Stopwatch lastTimeRef) = do
+  t <- liftIO (getTime Monotonic)
+  t0 <- liftIO (Data.IORef.readIORef lastTimeRef)
+  liftIO (Data.IORef.writeIORef lastTimeRef t)
+  return (diffTimeSpec t t0)
+
+
+timeSpecToSeconds :: Fractional a => TimeSpec -> a
+timeSpecToSeconds ts =
+  fromInteger (toNanoSecs ts) * 1e-9
+
+
+renderScene :: ShaderRepository -> MapResources -> V4 (V4 Float) -> IO ()
 renderScene shaderRepository mapResources viewMatrix = do
   glClear (GL_DEPTH_BUFFER_BIT .|. GL_COLOR_BUFFER_BIT)
 
@@ -891,13 +913,14 @@ renderScene shaderRepository mapResources viewMatrix = do
   drawMap shaderRepository mapResources
 
 
-
+createOpenGLWindow :: Text -> Managed SDL.Window
 createOpenGLWindow windowTitle = do
   SDL.initialize [ SDL.InitVideo ]
   window <- managed (bracket createGLWindow SDL.destroyWindow)
   SDL.glCreateContext window >>= SDL.glMakeCurrent window
   installDebugHook
   SDL.swapInterval $= SDL.SynchronizedUpdates
+  _ <- SDL.setMouseLocationMode SDL.RelativeLocation
   return window
 
   where
@@ -912,6 +935,7 @@ createOpenGLWindow windowTitle = do
 
       in  SDL.createWindow windowTitle windowConfig
 
+compileShader :: MonadIO m => GLenum -> FilePath -> m GLuint
 compileShader stage sourceFile = liftIO $ do
   src <- readFile sourceFile
 
@@ -929,7 +953,7 @@ compileShader stage sourceFile = liftIO $ do
           glGetShaderiv shaderName GL_COMPILE_STATUS ptr *> peek ptr)
 
   unless
-    (fromIntegral compiled == GL_TRUE)
+    (compiled == GL_TRUE)
     (do putStrLn ("Shader stage failed to compile: " <> show stage)
 
         logLen <-
@@ -946,6 +970,7 @@ compileShader stage sourceFile = liftIO $ do
   pure shaderName
 
 
+linkProgram :: (MonadIO m, Foldable t) => t GLuint -> m GLuint
 linkProgram shaders = liftIO $ do
   programName <- glCreateProgram
 
@@ -957,7 +982,7 @@ linkProgram shaders = liftIO $ do
     alloca (\ptr -> glGetProgramiv programName GL_LINK_STATUS ptr *> peek ptr)
 
   unless
-    (fromIntegral compiled == GL_TRUE)
+    (compiled == GL_TRUE)
     (do putStrLn "Program failed to link"
 
         logLen <-
@@ -1054,13 +1079,14 @@ configureVertexArrayAttributes vao formats =
       vafAttribute
       vafComponents
       vafType
-      (fromIntegral GL_FALSE)
+      GL_FALSE
       vafOffset
 
 
 newIORef :: MonadIO m => a -> m (IORef a)
 newIORef = liftIO . Data.IORef.newIORef
 
+faceToLayer :: BSPFile -> ShaderRepository -> Face -> TCShader.SortLayer
 faceToLayer bspFile shaderRepository face =
   case lookupShader
          shaderRepository
@@ -1071,14 +1097,14 @@ faceToLayer bspFile shaderRepository face =
     Just shader -> sortShader shader
     _ -> TCShader.Opaque
 
+sortShader :: TCShader.Shader -> TCShader.SortLayer
 sortShader shader =
-  case getLast (TCShader._sort shader) of
-    Just layer -> layer
-    Nothing ->
-      case toList (TCShader._passes shader) of
-        (p:_) ->
-          case getLast (TCShader._blendFunc p) of
-            Just (TCShader.One, TCShader.Zero) -> TCShader.Opaque
-            Just _ -> TCShader.Blend0
-            Nothing -> TCShader.Opaque
-        _ -> TCShader.Opaque
+  fromMaybe
+    (case toList (TCShader._passes shader) of
+      (p:_) ->
+        case getLast (TCShader._blendFunc p) of
+          Just (TCShader.One, TCShader.Zero) -> TCShader.Opaque
+          Just _ -> TCShader.Blend0
+          Nothing -> TCShader.Opaque
+      _ -> TCShader.Opaque)
+    (getLast (TCShader._sort shader))
