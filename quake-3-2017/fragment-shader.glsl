@@ -46,17 +46,15 @@ out vec4 result;
 void main() {
 
   DrawInfo di = faceDrawInfos[drawId];
-  Material m = materials[di.materialIndex];
+  Material m = materials[drawId];
 
   result = vec4(0);
-
-  vec4 lightMap = texture2D(lightMaps[di.lightMapIndex], v_texCoord_lm);
 
   for (int i = 0; i < m.nPasses; i++) {
     Pass p = passes[m.firstPass + i];
     vec4 source =
       texture2D(p.diffuseTexture, v_texCoord) * (1 - p.lightMap) +
-      lightMap * p.lightMap;
+      texture2D(p.diffuseTexture, v_texCoord_lm) * p.lightMap;
 
     result =
       source
