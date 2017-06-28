@@ -16,6 +16,7 @@ instance Num a => Num (Behavior a) where
   negate = fmap negate
   (-) = liftA2 (-)
 
+
 {-| quake3 takes a clock and stream of SDL events and interprets them into Quake 3
 scenes.
 -}
@@ -39,86 +40,118 @@ quake3 physicsSteps sdlEvents =
     -- The rotation of the FPS camera. Instantaneously updates based on mouse
     -- motion (that is, independently of the physics clock). Stored as radians.
     pitchAndYaw <-
-      let
-        pixelMotionToRadians (V2 x y) =
-          negate (V2 (fromIntegral x) (fromIntegral y)) * 0.001
+      anglesFromMouseMotion mouseMotionEvents
 
-        update mouseMotionEvent old =
-          old + pixelMotionToRadians (SDL.mouseMotionEventRelMotion mouseMotionEvent)
+    forwardAxis <-
+      keyAxis keyboardEvents SDL.ScancodeW SDL.ScancodeS
 
-      in
-        accumB (V2 0 0) (fmap update mouseMotionEvents)
+    rightAxis <-
+      keyAxis keyboardEvents SDL.ScancodeD SDL.ScancodeA
 
+    camera pitchAndYaw forwardAxis rightAxis physicsSteps
+
+
+anglesFromMouseMotion
+  :: (MonadMoment m, Fractional a)
+  => Event SDL.MouseMotionEventData -> m (Behavior (V2 a))
+anglesFromMouseMotion mouseMotionEvents =
+  let
+    pixelMotionToRadians (V2 x y) =
+      negate (V2 (fromIntegral x) (fromIntegral y)) * 0.001
+
+    update mouseMotionEvent old =
+      old + pixelMotionToRadians (SDL.mouseMotionEventRelMotion mouseMotionEvent)
+
+  in
+    accumB (V2 0 0) (fmap update mouseMotionEvents)
+
+
+keyAxis
+  :: (Num b, MonadMoment m)
+  => Event SDL.KeyboardEventData
+  -> SDL.Scancode
+  -> SDL.Scancode
+  -> m (Behavior b)
+keyAxis keyboardEvents positive negative =
+  let
+    filterKeyEvents k =
+      filterJust
+        (fmap (justScancode k) keyboardEvents)
+
+    keyState =
+      stepper SDL.Released . fmap SDL.keyboardEventKeyMotion
+
+    keyStateToSpeed state =
+      case state of
+        SDL.Pressed ->
+          1
+
+        SDL.Released ->
+          0
+
+  in
+    do
+      posState <-
+        keyState (filterKeyEvents positive)
+
+      negState <-
+        keyState (filterKeyEvents negative)
+
+      return (fmap keyStateToSpeed posState - fmap keyStateToSpeed negState)
+
+
+camera
+  :: (MonadMoment m, RealFloat a, Conjugate a, Epsilon a)
+  => Behavior (V2 a) -- ^ The yaw and pitch of the camera
+  -> Behavior a -- ^ Motion along the forward axis
+  -> Behavior a -- ^ Motion along the right (strafe) axis
+  -> Event a -- ^ Physics clock ticks
+  -> m (Behavior (M44 a))
+camera pitchAndYaw forwardAxis rightAxis physicsSteps =
+  do
     let
+      -- Form a rotation quaternion from the pitch and yaw angles
       anglesToRotation (V2 x y) =
         axisAngle (V3 0 1 0) x * axisAngle (V3 1 0 0) y
 
       cameraRotation =
         fmap anglesToRotation pitchAndYaw
 
-    let
+      -- The forward vector of the camera in world space
       forwardVector =
         rotate <$> cameraRotation <*> pure (V3 0 0 (-1))
 
+      -- The right (strafe) vector of the camera in world space
       rightVector =
         fmap
           (\(V2 x _) ->
              let
                rotation =
-                 axisAngle (V3 0 1 0) x
+                 axisAngle (V3 0 1 0) (x - pi / 2)
 
              in
                rotate rotation (V3 0 0 (-1)))
           pitchAndYaw
 
-    forwardMotion <-
-      do
-        let
-          justScancode k e =
-            if SDL.keysymScancode (SDL.keyboardEventKeysym e) == k
-              then Just e
-              else Nothing
+    let
+      forwardMotion =
+        100 * forwardAxis
 
-          filterKeyEvents k =
-            filterJust
-              (fmap (justScancode k) keyboardEvents)
-
-          wKeyEvents =
-            filterKeyEvents SDL.ScancodeW
-
-          sKeyEvents =
-            filterKeyEvents SDL.ScancodeS
-
-          keyState =
-            stepper SDL.Released . fmap SDL.keyboardEventKeyMotion
-
-        wState <-
-          keyState wKeyEvents
-
-        sState <-
-          keyState sKeyEvents
-
-        let
-          keyStateToSpeed state =
-            case state of
-              SDL.Pressed ->
-                1
-
-              SDL.Released ->
-                0
-
-        pure
-          (100 * (fmap keyStateToSpeed wState - fmap keyStateToSpeed sState))
+      strafeMotion =
+        100 * rightAxis
 
     cameraPosition <-
       accumB
         (V3 680 100 (-100))
         (let
-           update forwardVector dt oldPosition =
-             oldPosition + forwardVector ^* dt
+           update motion dt oldPosition =
+             oldPosition + motion ^* dt
 
          in
-           update <$> (liftA2 (^*) forwardVector forwardMotion) <@> physicsSteps)
+           update
+             <$> (liftA2 (^*) forwardVector forwardMotion +
+                  liftA2 (^*) rightVector strafeMotion)
+             <@> physicsSteps)
 
     pure
       (let
@@ -150,3 +183,12 @@ asMouseMotionEvent e =
 
     _ ->
       Nothing
+
+
+justScancode :: SDL.Scancode
+             -> SDL.KeyboardEventData
+             -> Maybe SDL.KeyboardEventData
+justScancode k e =
+  if SDL.keysymScancode (SDL.keyboardEventKeysym e) == k
+    then Just e
+    else Nothing
