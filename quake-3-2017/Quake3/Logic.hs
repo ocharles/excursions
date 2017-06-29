@@ -1,6 +1,6 @@
 {-# language NamedFieldPuns #-}
 
-module Logic where
+module Quake3.Logic where
 
 import Linear
 import Reactive.Banana
